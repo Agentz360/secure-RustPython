@@ -263,7 +263,6 @@ impl<T> PyTuple<PyRef<T>> {
     with(AsMapping, AsNumber, AsSequence, Hashable, Comparable, Iterable, Constructor, Representable)
 )]
 impl PyTuple {
-    #[pymethod]
     fn __add__(
         zelf: PyRef<Self>,
         other: PyObjectRef,
@@ -298,13 +297,10 @@ impl PyTuple {
     }
 
     #[inline]
-    #[pymethod]
     pub const fn __len__(&self) -> usize {
         self.elements.len()
     }
 
-    #[pymethod(name = "__rmul__")]
-    #[pymethod]
     fn __mul__(zelf: PyRef<Self>, value: ArgSize, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         Self::repeat(zelf, value.into(), vm)
     }
@@ -319,7 +315,6 @@ impl PyTuple {
         }
     }
 
-    #[pymethod]
     fn __getitem__(&self, needle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
         self._getitem(&needle, vm)
     }
@@ -349,7 +344,6 @@ impl PyTuple {
         Ok(false)
     }
 
-    #[pymethod]
     fn __contains__(&self, needle: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
         self._contains(&needle, vm)
     }

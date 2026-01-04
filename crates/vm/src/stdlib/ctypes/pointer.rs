@@ -1,7 +1,8 @@
 use super::base::CDATA_BUFFER_METHODS;
 use super::{PyCArray, PyCData, PyCSimple, PyCStructure, StgInfo, StgInfoFlags};
-use crate::protocol::{BufferDescriptor, PyBuffer, PyNumberMethods};
-use crate::types::{AsBuffer, AsNumber, Constructor, Initializer};
+use crate::atomic_func;
+use crate::protocol::{BufferDescriptor, PyBuffer, PyMappingMethods, PyNumberMethods};
+use crate::types::{AsBuffer, AsMapping, AsNumber, Constructor, Initializer};
 use crate::{
     AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
     builtins::{PyBytes, PyInt, PyList, PySlice, PyStr, PyType, PyTypeRef},
@@ -137,7 +138,6 @@ impl PyCPointerType {
         )))
     }
 
-    #[pymethod]
     fn __mul__(cls: PyTypeRef, n: isize, vm: &VirtualMachine) -> PyResult {
         use super::array::array_type_from_ctype;
 
@@ -261,7 +261,7 @@ impl Initializer for PyCPointer {
 
 #[pyclass(
     flags(BASETYPE, IMMUTABLETYPE),
-    with(Constructor, Initializer, AsNumber, AsBuffer)
+    with(Constructor, Initializer, AsNumber, AsBuffer, AsMapping)
 )]
 impl PyCPointer {
     /// Get the pointer value stored in buffer as usize
@@ -346,7 +346,6 @@ impl PyCPointer {
     }
 
     // Pointer_subscript
-    #[pymethod]
     fn __getitem__(zelf: &Py<Self>, item: PyObjectRef, vm: &VirtualMachine) -> PyResult {
         // PyIndex_Check
         if let Some(i) = item.downcast_ref::<PyInt>() {
@@ -529,7 +528,6 @@ impl PyCPointer {
     }
 
     // Pointer_ass_item
-    #[pymethod]
     fn __setitem__(
         zelf: &Py<Self>,
         item: PyObjectRef,
@@ -783,6 +781,27 @@ impl AsNumber for PyCPointer {
             ..PyNumberMethods::NOT_IMPLEMENTED
         };
         &AS_NUMBER
+    }
+}
+
+impl AsMapping for PyCPointer {
+    fn as_mapping() -> &'static PyMappingMethods {
+        use std::sync::LazyLock;
+        static AS_MAPPING: LazyLock<PyMappingMethods> = LazyLock::new(|| PyMappingMethods {
+            subscript: atomic_func!(|mapping, needle, vm| {
+                let zelf = PyCPointer::mapping_downcast(mapping);
+                PyCPointer::__getitem__(zelf, needle.to_owned(), vm)
+            }),
+            ass_subscript: atomic_func!(|mapping, needle, value, vm| {
+                let zelf = PyCPointer::mapping_downcast(mapping);
+                match value {
+                    Some(value) => PyCPointer::__setitem__(zelf, needle.to_owned(), value, vm),
+                    None => Err(vm.new_type_error("Pointer does not support item deletion")),
+                }
+            }),
+            ..PyMappingMethods::NOT_IMPLEMENTED
+        });
+        &AS_MAPPING
     }
 }
 
