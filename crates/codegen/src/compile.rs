@@ -98,12 +98,6 @@ enum NameUsage {
     Delete,
 }
 
-enum CallType {
-    Positional { nargs: u32 },
-    Keyword { nargs: u32 },
-    Ex { has_kwargs: bool },
-}
-
 fn is_forbidden_name(name: &str) -> bool {
     // See https://docs.python.org/3/library/constants.html#built-in-constants
     const BUILTIN_CONSTANTS: &[&str] = &["__debug__"];
@@ -494,7 +488,7 @@ impl Compiler {
                 }
                 ExprContext::Store => {
                     emit!(self, Instruction::BuildSlice { argc });
-                    emit!(self, Instruction::StoreSubscript);
+                    emit!(self, Instruction::StoreSubscr);
                 }
                 _ => unreachable!(),
             }
@@ -505,8 +499,8 @@ impl Compiler {
             // Emit appropriate instruction based on context
             match ctx {
                 ExprContext::Load => emit!(self, Instruction::Subscript),
-                ExprContext::Store => emit!(self, Instruction::StoreSubscript),
-                ExprContext::Del => emit!(self, Instruction::DeleteSubscript),
+                ExprContext::Store => emit!(self, Instruction::StoreSubscr),
+                ExprContext::Del => emit!(self, Instruction::DeleteSubscr),
                 ExprContext::Invalid => {
                     return Err(self.error(CodegenErrorType::SyntaxError(
                         "Invalid expression context".to_owned(),
@@ -1013,7 +1007,7 @@ impl Compiler {
                 // Stack when in FinallyEnd: [..., prev_exc, exc] or
                 // [..., prev_exc, exc, return_value] if preserve_tos
                 // Note: No lasti here - it's only pushed for cleanup handler exceptions
-                // We need to pop: exc, prev_exc (via PopException)
+                // We need to pop: exc, prev_exc (via PopExcept)
                 if preserve_tos {
                     emit!(self, Instruction::Swap { index: 2 });
                 }
@@ -1021,7 +1015,7 @@ impl Compiler {
                 if preserve_tos {
                     emit!(self, Instruction::Swap { index: 2 });
                 }
-                emit!(self, Instruction::PopException); // prev_exc is restored
+                emit!(self, Instruction::PopExcept); // prev_exc is restored
             }
 
             FBlockType::With | FBlockType::AsyncWith => {
@@ -1034,13 +1028,17 @@ impl Compiler {
                 if preserve_tos {
                     emit!(self, Instruction::Swap { index: 2 });
                 }
+                // Stack after swap: [..., return_value, __exit__] or [..., __exit__]
 
-                // Call __exit__(None, None, None) - compiler_call_exit_with_nones
-                // Stack: [..., __exit__] or [..., return_value, __exit__]
+                // Call __exit__(None, None, None)
+                // Call protocol: [callable, self_or_null, arg1, arg2, arg3]
+                emit!(self, Instruction::PushNull);
+                // Stack: [..., __exit__, NULL]
                 self.emit_load_const(ConstantData::None);
                 self.emit_load_const(ConstantData::None);
                 self.emit_load_const(ConstantData::None);
-                emit!(self, Instruction::CallFunctionPositional { nargs: 3 });
+                // Stack: [..., __exit__, NULL, None, None, None]
+                emit!(self, Instruction::Call { nargs: 3 });
 
                 // For async with, await the result
                 if matches!(info.fb_type, FBlockType::AsyncWith) {
@@ -1057,7 +1055,7 @@ impl Compiler {
                 if preserve_tos {
                     emit!(self, Instruction::Swap { index: 2 });
                 }
-                emit!(self, Instruction::PopException);
+                emit!(self, Instruction::PopExcept);
 
                 // If there's an exception name, clean it up
                 if let FBlockDatum::ExceptionName(ref name) = info.fb_datum {
@@ -1342,7 +1340,7 @@ impl Compiler {
         }
 
         if Self::find_ann(statements) {
-            emit!(self, Instruction::SetupAnnotation);
+            emit!(self, Instruction::SetupAnnotations);
         }
 
         self.compile_statements(statements)?;
@@ -1362,7 +1360,7 @@ impl Compiler {
         self.symbol_table_stack.push(symbol_table);
 
         if Self::find_ann(body) {
-            emit!(self, Instruction::SetupAnnotation);
+            emit!(self, Instruction::SetupAnnotations);
         }
 
         if let Some((last, body)) = body.split_last() {
@@ -1594,9 +1592,9 @@ impl Compiler {
             NameOp::Name => {
                 let idx = self.get_global_name_index(&name);
                 let op = match usage {
-                    NameUsage::Load => Instruction::LoadNameAny,
-                    NameUsage::Store => Instruction::StoreLocal,
-                    NameUsage::Delete => Instruction::DeleteLocal,
+                    NameUsage::Load => Instruction::LoadName,
+                    NameUsage::Store => Instruction::StoreName,
+                    NameUsage::Delete => Instruction::DeleteName,
                 };
                 self.emit_arg(idx, op);
             }
@@ -1815,7 +1813,7 @@ impl Compiler {
                     None => bytecode::RaiseKind::BareRaise,
                 };
                 self.set_source_range(*range);
-                emit!(self, Instruction::Raise { kind });
+                emit!(self, Instruction::RaiseVarargs { kind });
             }
             Stmt::Try(StmtTry {
                 body,
@@ -1875,18 +1873,19 @@ impl Compiler {
 
                     let assertion_error = self.name("AssertionError");
                     emit!(self, Instruction::LoadGlobal(assertion_error));
+                    emit!(self, Instruction::PushNull);
                     match msg {
                         Some(e) => {
                             self.compile_expression(e)?;
-                            emit!(self, Instruction::CallFunctionPositional { nargs: 1 });
+                            emit!(self, Instruction::Call { nargs: 1 });
                         }
                         None => {
-                            emit!(self, Instruction::CallFunctionPositional { nargs: 0 });
+                            emit!(self, Instruction::Call { nargs: 0 });
                         }
                     }
                     emit!(
                         self,
-                        Instruction::Raise {
+                        Instruction::RaiseVarargs {
                             kind: bytecode::RaiseKind::Raise,
                         }
                     );
@@ -2092,17 +2091,23 @@ impl Compiler {
         Ok(())
     }
 
+    /// Push decorators onto the stack in source order.
+    /// For @dec1 @dec2 def foo(): stack becomes [dec1, NULL, dec2, NULL]
     fn prepare_decorators(&mut self, decorator_list: &[Decorator]) -> CompileResult<()> {
         for decorator in decorator_list {
             self.compile_expression(&decorator.expression)?;
+            emit!(self, Instruction::PushNull);
         }
         Ok(())
     }
 
+    /// Apply decorators in reverse order (LIFO from stack).
+    /// Stack [dec1, NULL, dec2, NULL, func] -> dec2(func) -> dec1(dec2(func))
+    /// The forward loop works because each Call pops from TOS, naturally
+    /// applying decorators bottom-up (innermost first).
     fn apply_decorators(&mut self, decorator_list: &[Decorator]) {
-        // Apply decorators:
         for _ in decorator_list {
-            emit!(self, Instruction::CallFunctionPositional { nargs: 1 });
+            emit!(self, Instruction::Call { nargs: 1 });
         }
     }
 
@@ -2142,9 +2147,10 @@ impl Compiler {
 
         // Create type params function with closure
         self.make_closure(code, bytecode::MakeFunctionFlags::empty())?;
+        emit!(self, Instruction::PushNull);
 
         // Call the function immediately
-        emit!(self, Instruction::CallFunctionPositional { nargs: 0 });
+        emit!(self, Instruction::Call { nargs: 0 });
 
         Ok(())
     }
@@ -2379,7 +2385,7 @@ impl Compiler {
                 // which then properly restores prev_exc before going to outer handler
                 emit!(
                     self,
-                    Instruction::Raise {
+                    Instruction::RaiseVarargs {
                         kind: bytecode::RaiseKind::ReraiseFromStack
                     }
                 );
@@ -2391,10 +2397,10 @@ impl Compiler {
             if let Some(cleanup) = finally_cleanup_block {
                 self.switch_to_block(cleanup);
                 emit!(self, Instruction::CopyItem { index: 3_u32 });
-                emit!(self, Instruction::PopException);
+                emit!(self, Instruction::PopExcept);
                 emit!(
                     self,
-                    Instruction::Raise {
+                    Instruction::RaiseVarargs {
                         kind: bytecode::RaiseKind::ReraiseFromStack
                     }
                 );
@@ -2439,7 +2445,7 @@ impl Compiler {
         )?;
 
         // Exception is on top of stack now, pushed by unwind_blocks
-        // PUSH_EXC_INFO transforms [exc] -> [prev_exc, exc] for PopException
+        // PUSH_EXC_INFO transforms [exc] -> [prev_exc, exc] for PopExcept
         emit!(self, Instruction::PushExcInfo);
         for handler in handlers {
             let ExceptHandler::ExceptHandler(ExceptHandlerExceptHandler {
@@ -2524,7 +2530,7 @@ impl Compiler {
                 // which does COPY 3; POP_EXCEPT; RERAISE
                 emit!(
                     self,
-                    Instruction::Raise {
+                    Instruction::RaiseVarargs {
                         kind: bytecode::RaiseKind::ReraiseFromStack,
                     }
                 );
@@ -2537,7 +2543,7 @@ impl Compiler {
             // POP_BLOCK (HandlerCleanup) then POP_BLOCK (SETUP_CLEANUP)
             // followed by POP_EXCEPT
             self.pop_fblock(FBlockType::ExceptionHandler);
-            emit!(self, Instruction::PopException);
+            emit!(self, Instruction::PopExcept);
 
             // Delete the exception variable if it was bound (normal path)
             if let Some(alias) = name {
@@ -2577,7 +2583,7 @@ impl Compiler {
         // NOTE: We emit RERAISE 0 BEFORE popping fblock so it is within cleanup handler scope
         emit!(
             self,
-            Instruction::Raise {
+            Instruction::RaiseVarargs {
                 kind: bytecode::RaiseKind::ReraiseFromStack,
             }
         );
@@ -2593,10 +2599,10 @@ impl Compiler {
         // RERAISE 1: reraise with lasti
         self.switch_to_block(cleanup_block);
         emit!(self, Instruction::CopyItem { index: 3_u32 });
-        emit!(self, Instruction::PopException);
+        emit!(self, Instruction::PopExcept);
         emit!(
             self,
-            Instruction::Raise {
+            Instruction::RaiseVarargs {
                 kind: bytecode::RaiseKind::ReraiseFromStack,
             }
         );
@@ -2671,7 +2677,7 @@ impl Compiler {
             // Stack: [lasti, prev_exc, exc] - exception is on top
             emit!(
                 self,
-                Instruction::Raise {
+                Instruction::RaiseVarargs {
                     kind: bytecode::RaiseKind::ReraiseFromStack,
                 }
             );
@@ -2689,11 +2695,11 @@ impl Compiler {
             // COPY 3: copy the exception from position 3
             emit!(self, Instruction::CopyItem { index: 3_u32 });
             // POP_EXCEPT: restore prev_exc as current exception
-            emit!(self, Instruction::PopException);
+            emit!(self, Instruction::PopExcept);
             // RERAISE 1: reraise with lasti from stack
             emit!(
                 self,
-                Instruction::Raise {
+                Instruction::RaiseVarargs {
                     kind: bytecode::RaiseKind::ReraiseFromStack,
                 }
             );
@@ -2962,7 +2968,7 @@ impl Compiler {
 
         // POP_BLOCK - no-op for us with exception tables (fblocks handle this)
         // POP_EXCEPT - restore previous exception context
-        emit!(self, Instruction::PopException);
+        emit!(self, Instruction::PopExcept);
         // Stack: []
 
         if !finalbody.is_empty() {
@@ -2981,7 +2987,7 @@ impl Compiler {
         // Stack: [result, prev_exc]
 
         // POP_EXCEPT
-        emit!(self, Instruction::PopException);
+        emit!(self, Instruction::PopExcept);
         // Stack: [result]
 
         // RERAISE 0
@@ -3224,11 +3230,6 @@ impl Compiler {
                 num_typeparam_args += 1;
             }
 
-            // SWAP if we have both
-            if num_typeparam_args == 2 {
-                emit!(self, Instruction::Swap { index: 2 });
-            }
-
             // Enter type params scope
             let type_params_name = format!("<generic parameters of {name}>");
             self.push_output(
@@ -3307,23 +3308,40 @@ impl Compiler {
             // Make closure for type params code
             self.make_closure(type_params_code, bytecode::MakeFunctionFlags::empty())?;
 
-            // Call the closure
+            // Call the type params closure with defaults/kwdefaults as arguments.
+            // Call protocol: [callable, self_or_null, arg1, ..., argN]
+            // We need to reorder: [args..., closure] -> [closure, NULL, args...]
+            // Using Swap operations to move closure down and insert NULL.
+            // Note: num_typeparam_args is at most 2 (defaults tuple, kwdefaults dict).
             if num_typeparam_args > 0 {
-                emit!(
-                    self,
-                    Instruction::Swap {
-                        index: (num_typeparam_args + 1) as u32
+                match num_typeparam_args {
+                    1 => {
+                        // Stack: [arg1, closure]
+                        emit!(self, Instruction::Swap { index: 2 }); // [closure, arg1]
+                        emit!(self, Instruction::PushNull); // [closure, arg1, NULL]
+                        emit!(self, Instruction::Swap { index: 2 }); // [closure, NULL, arg1]
                     }
-                );
+                    2 => {
+                        // Stack: [arg1, arg2, closure]
+                        emit!(self, Instruction::Swap { index: 3 }); // [closure, arg2, arg1]
+                        emit!(self, Instruction::Swap { index: 2 }); // [closure, arg1, arg2]
+                        emit!(self, Instruction::PushNull); // [closure, arg1, arg2, NULL]
+                        emit!(self, Instruction::Swap { index: 3 }); // [closure, NULL, arg2, arg1]
+                        emit!(self, Instruction::Swap { index: 2 }); // [closure, NULL, arg1, arg2]
+                    }
+                    _ => unreachable!("only defaults and kwdefaults are supported"),
+                }
                 emit!(
                     self,
-                    Instruction::CallFunctionPositional {
+                    Instruction::Call {
                         nargs: num_typeparam_args as u32
                     }
                 );
             } else {
-                // No arguments, just call the closure
-                emit!(self, Instruction::CallFunctionPositional { nargs: 0 });
+                // Stack: [closure]
+                emit!(self, Instruction::PushNull);
+                // Stack: [closure, NULL]
+                emit!(self, Instruction::Call { nargs: 0 });
             }
         }
 
@@ -3561,20 +3579,20 @@ impl Compiler {
         let dunder_name = self.name("__name__");
         emit!(self, Instruction::LoadGlobal(dunder_name));
         let dunder_module = self.name("__module__");
-        emit!(self, Instruction::StoreLocal(dunder_module));
+        emit!(self, Instruction::StoreName(dunder_module));
 
         // Store __qualname__
         self.emit_load_const(ConstantData::Str {
             value: qualname.into(),
         });
         let qualname_name = self.name("__qualname__");
-        emit!(self, Instruction::StoreLocal(qualname_name));
+        emit!(self, Instruction::StoreName(qualname_name));
 
         // Store __doc__ only if there's an explicit docstring
         if let Some(doc) = doc_str {
             self.emit_load_const(ConstantData::Str { value: doc.into() });
             let doc_name = self.name("__doc__");
-            emit!(self, Instruction::StoreLocal(doc_name));
+            emit!(self, Instruction::StoreName(doc_name));
         }
 
         // Store __firstlineno__ (new in Python 3.12+)
@@ -3582,22 +3600,22 @@ impl Compiler {
             value: BigInt::from(firstlineno),
         });
         let firstlineno_name = self.name("__firstlineno__");
-        emit!(self, Instruction::StoreLocal(firstlineno_name));
+        emit!(self, Instruction::StoreName(firstlineno_name));
 
         // Set __type_params__ if we have type parameters
         if type_params.is_some() {
             // Load .type_params from enclosing scope
             let dot_type_params = self.name(".type_params");
-            emit!(self, Instruction::LoadNameAny(dot_type_params));
+            emit!(self, Instruction::LoadName(dot_type_params));
 
             // Store as __type_params__
             let dunder_type_params = self.name("__type_params__");
-            emit!(self, Instruction::StoreLocal(dunder_type_params));
+            emit!(self, Instruction::StoreName(dunder_type_params));
         }
 
         // Setup annotations if needed
         if Self::find_ann(body) {
-            emit!(self, Instruction::SetupAnnotation);
+            emit!(self, Instruction::SetupAnnotations);
         }
 
         // 3. Compile the class body
@@ -3617,7 +3635,7 @@ impl Compiler {
             emit!(self, Instruction::LoadClosure(classcell_idx.to_u32()));
             emit!(self, Instruction::CopyItem { index: 1_u32 });
             let classcell = self.name("__classcell__");
-            emit!(self, Instruction::StoreLocal(classcell));
+            emit!(self, Instruction::StoreName(classcell));
         } else {
             self.emit_load_const(ConstantData::None);
         }
@@ -3659,7 +3677,7 @@ impl Compiler {
             // Compile type parameters and store as .type_params
             self.compile_type_params(type_params.unwrap())?;
             let dot_type_params = self.name(".type_params");
-            emit!(self, Instruction::StoreLocal(dot_type_params));
+            emit!(self, Instruction::StoreName(dot_type_params));
         }
 
         // Step 2: Compile class body (always done, whether generic or not)
@@ -3680,64 +3698,113 @@ impl Compiler {
             let dot_generic_base = self.name(".generic_base");
 
             // Create .generic_base
-            emit!(self, Instruction::LoadNameAny(dot_type_params));
+            emit!(self, Instruction::LoadName(dot_type_params));
             emit!(
                 self,
                 Instruction::CallIntrinsic1 {
                     func: bytecode::IntrinsicFunction1::SubscriptGeneric
                 }
             );
-            emit!(self, Instruction::StoreLocal(dot_generic_base));
+            emit!(self, Instruction::StoreName(dot_generic_base));
 
             // Generate class creation code
             emit!(self, Instruction::LoadBuildClass);
+            emit!(self, Instruction::PushNull);
 
             // Set up the class function with type params
             let mut func_flags = bytecode::MakeFunctionFlags::empty();
-            emit!(self, Instruction::LoadNameAny(dot_type_params));
+            emit!(self, Instruction::LoadName(dot_type_params));
             func_flags |= bytecode::MakeFunctionFlags::TYPE_PARAMS;
 
             // Create class function with closure
             self.make_closure(class_code, func_flags)?;
             self.emit_load_const(ConstantData::Str { value: name.into() });
 
-            // Compile original bases
-            let base_count = if let Some(arguments) = arguments {
-                for arg in &arguments.args {
-                    self.compile_expression(arg)?;
+            // Compile bases and call __build_class__
+            // Check for starred bases or **kwargs
+            let has_starred = arguments
+                .is_some_and(|args| args.args.iter().any(|arg| matches!(arg, Expr::Starred(_))));
+            let has_double_star =
+                arguments.is_some_and(|args| args.keywords.iter().any(|kw| kw.arg.is_none()));
+
+            if has_starred || has_double_star {
+                // Use CallFunctionEx for *bases or **kwargs
+                // Stack has: [__build_class__, NULL, class_func, name]
+                // Need to build: args tuple = (class_func, name, *bases, .generic_base)
+
+                // Compile bases with gather_elements (handles starred)
+                let (size, unpack) = if let Some(arguments) = arguments {
+                    self.gather_elements(2, &arguments.args)? // 2 = class_func + name already on stack
+                } else {
+                    // Just class_func and name (no bases)
+                    (2, false)
+                };
+
+                // Add .generic_base as final base
+                emit!(self, Instruction::LoadName(dot_generic_base));
+
+                // Build args tuple
+                if unpack {
+                    // Starred: gather_elements produced tuples on stack
+                    emit!(self, Instruction::BuildTuple { size: 1 }); // (.generic_base,)
+                    emit!(self, Instruction::BuildTupleFromTuples { size: size + 1 });
+                } else {
+                    // No starred: individual elements on stack
+                    // size includes class_func + name + bases count, +1 for .generic_base
+                    emit!(self, Instruction::BuildTuple { size: size + 1 });
                 }
-                arguments.args.len()
+
+                // Build kwargs if needed
+                let has_kwargs = arguments.is_some_and(|args| !args.keywords.is_empty());
+                if has_kwargs {
+                    self.compile_keywords(&arguments.unwrap().keywords)?;
+                }
+                emit!(self, Instruction::CallFunctionEx { has_kwargs });
             } else {
-                0
-            };
+                // Simple case: no starred bases, no **kwargs
+                // Compile bases normally
+                let base_count = if let Some(arguments) = arguments {
+                    for arg in &arguments.args {
+                        self.compile_expression(arg)?;
+                    }
+                    arguments.args.len()
+                } else {
+                    0
+                };
 
-            // Load .generic_base as the last base
-            emit!(self, Instruction::LoadNameAny(dot_generic_base));
+                // Load .generic_base as the last base
+                emit!(self, Instruction::LoadName(dot_generic_base));
 
-            let nargs = 2 + u32::try_from(base_count).expect("too many base classes") + 1; // function, name, bases..., generic_base
+                let nargs = 2 + u32::try_from(base_count).expect("too many base classes") + 1;
 
-            // Handle keyword arguments
-            if let Some(arguments) = arguments
-                && !arguments.keywords.is_empty()
-            {
-                for keyword in &arguments.keywords {
-                    if let Some(name) = &keyword.arg {
-                        self.emit_load_const(ConstantData::Str {
+                // Handle keyword arguments (no **kwargs here)
+                if let Some(arguments) = arguments
+                    && !arguments.keywords.is_empty()
+                {
+                    let mut kwarg_names = vec![];
+                    for keyword in &arguments.keywords {
+                        let name = keyword.arg.as_ref().expect(
+                            "keyword argument name must be set (no **kwargs in this branch)",
+                        );
+                        kwarg_names.push(ConstantData::Str {
                             value: name.as_str().into(),
                         });
+                        self.compile_expression(&keyword.value)?;
                     }
-                    self.compile_expression(&keyword.value)?;
+                    self.emit_load_const(ConstantData::Tuple {
+                        elements: kwarg_names,
+                    });
+                    emit!(
+                        self,
+                        Instruction::CallKw {
+                            nargs: nargs
+                                + u32::try_from(arguments.keywords.len())
+                                    .expect("too many keyword arguments")
+                        }
+                    );
+                } else {
+                    emit!(self, Instruction::Call { nargs });
                 }
-                emit!(
-                    self,
-                    Instruction::CallFunctionKeyword {
-                        nargs: nargs
-                            + u32::try_from(arguments.keywords.len())
-                                .expect("too many keyword arguments")
-                    }
-                );
-            } else {
-                emit!(self, Instruction::CallFunctionPositional { nargs });
             }
 
             // Return the created class
@@ -3748,21 +3815,22 @@ impl Compiler {
 
             // Execute the type params function
             self.make_closure(type_params_code, bytecode::MakeFunctionFlags::empty())?;
-            emit!(self, Instruction::CallFunctionPositional { nargs: 0 });
+            emit!(self, Instruction::PushNull);
+            emit!(self, Instruction::Call { nargs: 0 });
         } else {
             // Non-generic class: standard path
             emit!(self, Instruction::LoadBuildClass);
+            emit!(self, Instruction::PushNull);
 
             // Create class function with closure
             self.make_closure(class_code, bytecode::MakeFunctionFlags::empty())?;
             self.emit_load_const(ConstantData::Str { value: name.into() });
 
-            let call = if let Some(arguments) = arguments {
-                self.compile_call_inner(2, arguments)?
+            if let Some(arguments) = arguments {
+                self.compile_call_helper(2, arguments)?;
             } else {
-                CallType::Positional { nargs: 2 }
-            };
-            self.compile_normal_call(call);
+                emit!(self, Instruction::Call { nargs: 2 });
+            }
         }
 
         // Step 4: Apply decorators and store (common to both paths)
@@ -3912,10 +3980,11 @@ impl Compiler {
         // Stack: [..., __exit__]
         // Call __exit__(None, None, None)
         self.set_source_range(with_range);
+        emit!(self, Instruction::PushNull);
         self.emit_load_const(ConstantData::None);
         self.emit_load_const(ConstantData::None);
         self.emit_load_const(ConstantData::None);
-        emit!(self, Instruction::CallFunctionPositional { nargs: 3 });
+        emit!(self, Instruction::Call { nargs: 3 });
         if is_async {
             emit!(self, Instruction::GetAwaitable);
             self.emit_load_const(ConstantData::None);
@@ -3991,7 +4060,7 @@ impl Compiler {
         // Need to pop: True, exc, prev_exc, __exit__
         self.switch_to_block(suppress_block);
         emit!(self, Instruction::PopTop); // pop True (TO_BOOL result)
-        emit!(self, Instruction::PopException); // pop exc and restore prev_exc
+        emit!(self, Instruction::PopExcept); // pop exc and restore prev_exc
         emit!(self, Instruction::PopTop); // pop __exit__
         emit!(self, Instruction::PopTop); // pop lasti
         emit!(
@@ -4013,7 +4082,7 @@ impl Compiler {
         // If we cleared fblock, exceptions here would propagate uncaught.
         self.switch_to_block(cleanup_block);
         emit!(self, Instruction::CopyItem { index: 3 });
-        emit!(self, Instruction::PopException);
+        emit!(self, Instruction::PopExcept);
         emit!(self, Instruction::Reraise { depth: 1 });
 
         // ===== After block =====
@@ -4335,7 +4404,7 @@ impl Compiler {
                 );
             }
             // Use BINARY_OP/NB_SUBSCR to extract the element.
-            emit!(self, Instruction::BinarySubscript);
+            emit!(self, Instruction::BinarySubscr);
             // Compile the subpattern in irrefutable mode.
             self.compile_pattern_subpattern(pattern, pc)?;
         }
@@ -4588,7 +4657,7 @@ impl Compiler {
             // Stack: [subject, len, size]
             emit!(
                 self,
-                Instruction::CompareOperation {
+                Instruction::CompareOp {
                     op: ComparisonOperator::GreaterOrEqual
                 }
             );
@@ -4714,7 +4783,7 @@ impl Compiler {
                 // Stack: [rest_dict, k1, ..., kn, rest_dict]
                 emit!(self, Instruction::Swap { index: 2 });
                 // Stack: [rest_dict, k1, ..., kn-1, rest_dict, kn]
-                emit!(self, Instruction::DeleteSubscript);
+                emit!(self, Instruction::DeleteSubscr);
                 // Stack: [rest_dict, k1, ..., kn-1] (removed kn from rest_dict)
                 remaining -= 1;
             }
@@ -4892,7 +4961,7 @@ impl Compiler {
             self.emit_load_const(ConstantData::Integer { value: size.into() });
             emit!(
                 self,
-                Instruction::CompareOperation {
+                Instruction::CompareOp {
                     op: ComparisonOperator::Equal
                 }
             );
@@ -4905,7 +4974,7 @@ impl Compiler {
             });
             emit!(
                 self,
-                Instruction::CompareOperation {
+                Instruction::CompareOp {
                     op: ComparisonOperator::GreaterOrEqual
                 }
             );
@@ -4934,7 +5003,7 @@ impl Compiler {
         self.compile_expression(&p.value)?;
         emit!(
             self,
-            Instruction::CompareOperation {
+            Instruction::CompareOp {
                 op: bytecode::ComparisonOperator::Equal
             }
         );
@@ -5078,13 +5147,13 @@ impl Compiler {
     fn compile_addcompare(&mut self, op: &CmpOp) {
         use bytecode::ComparisonOperator::*;
         match op {
-            CmpOp::Eq => emit!(self, Instruction::CompareOperation { op: Equal }),
-            CmpOp::NotEq => emit!(self, Instruction::CompareOperation { op: NotEqual }),
-            CmpOp::Lt => emit!(self, Instruction::CompareOperation { op: Less }),
-            CmpOp::LtE => emit!(self, Instruction::CompareOperation { op: LessOrEqual }),
-            CmpOp::Gt => emit!(self, Instruction::CompareOperation { op: Greater }),
+            CmpOp::Eq => emit!(self, Instruction::CompareOp { op: Equal }),
+            CmpOp::NotEq => emit!(self, Instruction::CompareOp { op: NotEqual }),
+            CmpOp::Lt => emit!(self, Instruction::CompareOp { op: Less }),
+            CmpOp::LtE => emit!(self, Instruction::CompareOp { op: LessOrEqual }),
+            CmpOp::Gt => emit!(self, Instruction::CompareOp { op: Greater }),
             CmpOp::GtE => {
-                emit!(self, Instruction::CompareOperation { op: GreaterOrEqual })
+                emit!(self, Instruction::CompareOp { op: GreaterOrEqual })
             }
             CmpOp::In => emit!(self, Instruction::ContainsOp(Invert::No)),
             CmpOp::NotIn => emit!(self, Instruction::ContainsOp(Invert::Yes)),
@@ -5219,11 +5288,11 @@ impl Compiler {
         if let Expr::Name(ExprName { id, .. }) = &target {
             // Store as dict entry in __annotations__ dict:
             let annotations = self.name("__annotations__");
-            emit!(self, Instruction::LoadNameAny(annotations));
+            emit!(self, Instruction::LoadName(annotations));
             self.emit_load_const(ConstantData::Str {
                 value: self.mangle(id.as_str()).into_owned().into(),
             });
-            emit!(self, Instruction::StoreSubscript);
+            emit!(self, Instruction::StoreSubscr);
         } else {
             // Drop annotation if not assigned to simple identifier.
             emit!(self, Instruction::PopTop);
@@ -5360,7 +5429,7 @@ impl Compiler {
                 // stack: CONTAINER SLICE RESULT
                 emit!(self, Instruction::Swap { index: 3 });
                 emit!(self, Instruction::Swap { index: 2 });
-                emit!(self, Instruction::StoreSubscript);
+                emit!(self, Instruction::StoreSubscr);
             }
             AugAssignKind::Attr { idx } => {
                 // stack: CONTAINER RESULT
@@ -6087,49 +6156,36 @@ impl Compiler {
     }
 
     fn compile_call(&mut self, func: &Expr, args: &Arguments) -> CompileResult<()> {
-        let method = if let Expr::Attribute(ExprAttribute { value, attr, .. }) = &func {
+        // Method call: obj → LOAD_ATTR_METHOD → [method, self_or_null] → args → CALL
+        // Regular call: func → PUSH_NULL → args → CALL
+        if let Expr::Attribute(ExprAttribute { value, attr, .. }) = &func {
+            // Method call: compile object, then LOAD_ATTR_METHOD
+            // LOAD_ATTR_METHOD pushes [method, self_or_null] on stack
             self.compile_expression(value)?;
             let idx = self.name(attr.as_str());
-            emit!(self, Instruction::LoadMethod { idx });
-            true
+            emit!(self, Instruction::LoadAttrMethod { idx });
+            self.compile_call_helper(0, args)?;
         } else {
+            // Regular call: push func, then NULL for self_or_null slot
+            // Stack layout: [func, NULL, args...] - same as method call [func, self, args...]
             self.compile_expression(func)?;
-            false
-        };
-        let call = self.compile_call_inner(0, args)?;
-        if method {
-            self.compile_method_call(call)
-        } else {
-            self.compile_normal_call(call)
+            emit!(self, Instruction::PushNull);
+            self.compile_call_helper(0, args)?;
         }
         Ok(())
     }
 
-    fn compile_normal_call(&mut self, ty: CallType) {
-        match ty {
-            CallType::Positional { nargs } => {
-                emit!(self, Instruction::CallFunctionPositional { nargs })
-            }
-            CallType::Keyword { nargs } => emit!(self, Instruction::CallFunctionKeyword { nargs }),
-            CallType::Ex { has_kwargs } => emit!(self, Instruction::CallFunctionEx { has_kwargs }),
-        }
-    }
-    fn compile_method_call(&mut self, ty: CallType) {
-        match ty {
-            CallType::Positional { nargs } => {
-                emit!(self, Instruction::CallMethodPositional { nargs })
-            }
-            CallType::Keyword { nargs } => emit!(self, Instruction::CallMethodKeyword { nargs }),
-            CallType::Ex { has_kwargs } => emit!(self, Instruction::CallMethodEx { has_kwargs }),
-        }
-    }
-
-    fn compile_call_inner(
+    /// Compile call arguments and emit the appropriate CALL instruction.
+    /// This is shared between compiler_call and compiler_class.
+    fn compile_call_helper(
         &mut self,
         additional_positional: u32,
         arguments: &Arguments,
-    ) -> CompileResult<CallType> {
-        let count = u32::try_from(arguments.len()).unwrap() + additional_positional;
+    ) -> CompileResult<()> {
+        let args_count = u32::try_from(arguments.len()).expect("too many arguments");
+        let count = args_count
+            .checked_add(additional_positional)
+            .expect("too many arguments");
 
         // Normal arguments:
         let (size, unpack) = self.gather_elements(additional_positional, &arguments.args)?;
@@ -6141,7 +6197,7 @@ impl Compiler {
             }
         }
 
-        let call = if unpack || has_double_star {
+        if unpack || has_double_star {
             // Create a tuple with positional args:
             if unpack {
                 emit!(self, Instruction::BuildTupleFromTuples { size });
@@ -6154,30 +6210,40 @@ impl Compiler {
             if has_kwargs {
                 self.compile_keywords(&arguments.keywords)?;
             }
-            CallType::Ex { has_kwargs }
+            emit!(self, Instruction::CallFunctionEx { has_kwargs });
         } else if !arguments.keywords.is_empty() {
-            let mut kwarg_names = vec![];
+            // No **kwargs in this branch (has_double_star is false),
+            // so all keywords have arg.is_some()
+            let mut kwarg_names = Vec::with_capacity(arguments.keywords.len());
             for keyword in &arguments.keywords {
-                if let Some(name) = &keyword.arg {
-                    kwarg_names.push(ConstantData::Str {
-                        value: name.as_str().into(),
-                    });
-                } else {
-                    // This means **kwargs!
-                    panic!("name must be set");
-                }
+                let name = keyword
+                    .arg
+                    .as_ref()
+                    .expect("has_double_star is false, so arg must be Some");
+                kwarg_names.push(ConstantData::Str {
+                    value: name.as_str().into(),
+                });
                 self.compile_expression(&keyword.value)?;
             }
 
             self.emit_load_const(ConstantData::Tuple {
                 elements: kwarg_names,
             });
-            CallType::Keyword { nargs: count }
+            // nargs = positional args + keyword args
+            let positional = additional_positional
+                .checked_add(u32::try_from(arguments.args.len()).expect("too many positional args"))
+                .expect("too many positional args");
+            let keyword_count =
+                u32::try_from(arguments.keywords.len()).expect("too many keyword args");
+            let nargs = positional
+                .checked_add(keyword_count)
+                .expect("too many arguments");
+            emit!(self, Instruction::CallKw { nargs });
         } else {
-            CallType::Positional { nargs: count }
-        };
+            emit!(self, Instruction::Call { nargs: count });
+        }
 
-        Ok(call)
+        Ok(())
     }
 
     // Given a vector of expr / star expr generate code which gives either
@@ -6409,6 +6475,7 @@ impl Compiler {
 
         // Create comprehension function with closure
         self.make_closure(code, bytecode::MakeFunctionFlags::empty())?;
+        emit!(self, Instruction::PushNull);
 
         // Evaluate iterated item:
         self.compile_expression(&generators[0].iter)?;
@@ -6422,7 +6489,7 @@ impl Compiler {
         };
 
         // Call just created <listcomp> function:
-        emit!(self, Instruction::CallFunctionPositional { nargs: 1 });
+        emit!(self, Instruction::Call { nargs: 1 });
         if is_async_list_set_dict_comprehension {
             emit!(self, Instruction::GetAwaitable);
             self.emit_load_const(ConstantData::None);
@@ -6622,7 +6689,7 @@ impl Compiler {
             // Re-raise the exception
             emit!(
                 self,
-                Instruction::Raise {
+                Instruction::RaiseVarargs {
                     kind: bytecode::RaiseKind::ReraiseFromStack
                 }
             );
@@ -6838,10 +6905,11 @@ impl Compiler {
             match action {
                 UnwindAction::With { is_async } => {
                     // compiler_call_exit_with_nones
+                    emit!(self, Instruction::PushNull);
                     self.emit_load_const(ConstantData::None);
                     self.emit_load_const(ConstantData::None);
                     self.emit_load_const(ConstantData::None);
-                    emit!(self, Instruction::CallFunctionPositional { nargs: 3 });
+                    emit!(self, Instruction::Call { nargs: 3 });
 
                     if is_async {
                         emit!(self, Instruction::GetAwaitable);
@@ -6852,7 +6920,7 @@ impl Compiler {
                     emit!(self, Instruction::PopTop);
                 }
                 UnwindAction::HandlerCleanup => {
-                    emit!(self, Instruction::PopException);
+                    emit!(self, Instruction::PopExcept);
                 }
                 UnwindAction::FinallyTry { body, fblock_idx } => {
                     // compile finally body inline
@@ -6871,9 +6939,9 @@ impl Compiler {
                 UnwindAction::FinallyEnd => {
                     // Stack when in FinallyEnd: [..., prev_exc, exc]
                     // Note: No lasti here - it's only pushed for cleanup handler exceptions
-                    // We need to pop: exc, prev_exc (via PopException)
+                    // We need to pop: exc, prev_exc (via PopExcept)
                     emit!(self, Instruction::PopTop); // exc
-                    emit!(self, Instruction::PopException); // prev_exc is restored
+                    emit!(self, Instruction::PopExcept); // prev_exc is restored
                 }
                 UnwindAction::PopValue => {
                     // Pop the return value - continue/break cancels the pending return

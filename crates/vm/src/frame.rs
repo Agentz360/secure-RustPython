@@ -53,7 +53,7 @@ enum UnwindReason {
 struct FrameState {
     // We need 1 stack per frame
     /// The main data frame of the stack machine
-    stack: BoxVec<PyObjectRef>,
+    stack: BoxVec<Option<PyObjectRef>>,
     /// index of last instruction ran
     #[cfg(feature = "threading")]
     lasti: u32,
@@ -391,7 +391,7 @@ impl ExecutingFrame<'_> {
                     // Instruction::Reraise are reraise operations that should not add
                     // new traceback entries
                     let is_reraise = match op {
-                        bytecode::Instruction::Raise { kind } => matches!(
+                        bytecode::Instruction::RaiseVarargs { kind } => matches!(
                             kind.get(arg),
                             bytecode::RaiseKind::BareRaise | bytecode::RaiseKind::ReraiseFromStack
                         ),
@@ -610,12 +610,11 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             bytecode::Instruction::BinaryOp { op } => self.execute_bin_op(vm, op.get(arg)),
-            bytecode::Instruction::BinarySubscript => {
+            bytecode::Instruction::BinarySubscr => {
                 let key = self.pop_value();
                 let container = self.pop_value();
-                self.state
-                    .stack
-                    .push(container.get_item(key.as_object(), vm)?);
+                let result = container.get_item(key.as_object(), vm)?;
+                self.push_value(result);
                 Ok(None)
             }
 
@@ -676,14 +675,11 @@ impl ExecutingFrame<'_> {
             }
             */
             bytecode::Instruction::BuildString { size } => {
-                let s = self
+                let s: Wtf8Buf = self
                     .pop_multiple(size.get(arg) as usize)
-                    .as_slice()
-                    .iter()
-                    .map(|pyobj| pyobj.downcast_ref::<PyStr>().unwrap())
-                    .collect::<Wtf8Buf>();
-                let str_obj = vm.ctx.new_str(s);
-                self.push_value(str_obj.into());
+                    .map(|pyobj| pyobj.downcast::<PyStr>().unwrap())
+                    .collect();
+                self.push_value(vm.ctx.new_str(s).into());
                 Ok(None)
             }
             bytecode::Instruction::BuildTupleFromIter => {
@@ -707,16 +703,19 @@ impl ExecutingFrame<'_> {
                 self.push_value(list_obj.into());
                 Ok(None)
             }
-            bytecode::Instruction::CallFunctionEx { has_kwargs } => {
-                let args = self.collect_ex_args(vm, has_kwargs.get(arg))?;
+            bytecode::Instruction::Call { nargs } => {
+                // Stack: [callable, self_or_null, arg1, ..., argN]
+                let args = self.collect_positional_args(nargs.get(arg));
                 self.execute_call(args, vm)
             }
-            bytecode::Instruction::CallFunctionKeyword { nargs } => {
+            bytecode::Instruction::CallKw { nargs } => {
+                // Stack: [callable, self_or_null, arg1, ..., argN, kwarg_names]
                 let args = self.collect_keyword_args(nargs.get(arg));
                 self.execute_call(args, vm)
             }
-            bytecode::Instruction::CallFunctionPositional { nargs } => {
-                let args = self.collect_positional_args(nargs.get(arg));
+            bytecode::Instruction::CallFunctionEx { has_kwargs } => {
+                // Stack: [callable, self_or_null, args_tuple, (kwargs_dict)?]
+                let args = self.collect_ex_args(vm, has_kwargs.get(arg))?;
                 self.execute_call(args, vm)
             }
             bytecode::Instruction::CallIntrinsic1 { func } => {
@@ -732,18 +731,6 @@ impl ExecutingFrame<'_> {
                 self.push_value(result);
                 Ok(None)
             }
-            bytecode::Instruction::CallMethodEx { has_kwargs } => {
-                let args = self.collect_ex_args(vm, has_kwargs.get(arg))?;
-                self.execute_method_call(args, vm)
-            }
-            bytecode::Instruction::CallMethodKeyword { nargs } => {
-                let args = self.collect_keyword_args(nargs.get(arg));
-                self.execute_method_call(args, vm)
-            }
-            bytecode::Instruction::CallMethodPositional { nargs } => {
-                let args = self.collect_positional_args(nargs.get(arg));
-                self.execute_method_call(args, vm)
-            }
             bytecode::Instruction::CheckEgMatch => {
                 let match_type = self.pop_value();
                 let exc_value = self.pop_value();
@@ -753,7 +740,7 @@ impl ExecutingFrame<'_> {
                 self.push_value(matched);
                 Ok(None)
             }
-            bytecode::Instruction::CompareOperation { op } => self.execute_compare(vm, op.get(arg)),
+            bytecode::Instruction::CompareOp { op } => self.execute_compare(vm, op.get(arg)),
             bytecode::Instruction::ContainsOp(invert) => {
                 let b = self.pop_value();
                 let a = self.pop_value();
@@ -788,7 +775,7 @@ impl ExecutingFrame<'_> {
                     panic!("CopyItem: stack underflow");
                 }
                 let value = self.state.stack[stack_len - idx].clone();
-                self.push_value(value);
+                self.push_value_opt(value);
                 Ok(None)
             }
             bytecode::Instruction::DeleteAttr { idx } => self.delete_attr(vm, idx.get(arg)),
@@ -822,7 +809,7 @@ impl ExecutingFrame<'_> {
                 }
                 Ok(None)
             }
-            bytecode::Instruction::DeleteLocal(idx) => {
+            bytecode::Instruction::DeleteName(idx) => {
                 let name = self.code.names[idx.get(arg) as usize];
                 let res = self.locals.mapping().ass_subscript(name, None, vm);
 
@@ -835,7 +822,7 @@ impl ExecutingFrame<'_> {
                 }
                 Ok(None)
             }
-            bytecode::Instruction::DeleteSubscript => self.execute_delete_subscript(vm),
+            bytecode::Instruction::DeleteSubscr => self.execute_delete_subscript(vm),
             bytecode::Instruction::DictUpdate { index } => {
                 // Stack before: [..., dict, ..., source]  (source at TOS)
                 // Stack after:  [..., dict, ...]  (source consumed)
@@ -1095,6 +1082,18 @@ impl ExecutingFrame<'_> {
                 self.jump(target.get(arg));
                 Ok(None)
             }
+            bytecode::Instruction::JumpForward { target } => {
+                self.jump(target.get(arg));
+                Ok(None)
+            }
+            bytecode::Instruction::JumpBackward { target } => {
+                self.jump(target.get(arg));
+                Ok(None)
+            }
+            bytecode::Instruction::JumpBackwardNoInterrupt { target } => {
+                self.jump(target.get(arg));
+                Ok(None)
+            }
             bytecode::Instruction::ListAppend { i } => {
                 let item = self.pop_value();
                 let obj = self.nth_value(i.get(arg));
@@ -1106,6 +1105,9 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             bytecode::Instruction::LoadAttr { idx } => self.load_attr(vm, idx.get(arg)),
+            bytecode::Instruction::LoadAttrMethod { .. } => {
+                unreachable!("LoadAttrMethod is converted to LoadAttr during compilation")
+            }
             bytecode::Instruction::LoadBuildClass => {
                 self.push_value(vm.builtins.get_attr(identifier!(vm, __build_class__), vm)?);
                 Ok(None)
@@ -1177,22 +1179,7 @@ impl ExecutingFrame<'_> {
                 self.push_value(x);
                 Ok(None)
             }
-            bytecode::Instruction::LoadMethod { idx } => {
-                let obj = self.pop_value();
-                let method_name = self.code.names[idx.get(arg) as usize];
-                let method = PyMethod::get(obj, method_name, vm)?;
-                let (target, is_method, func) = match method {
-                    PyMethod::Function { target, func } => (target, true, func),
-                    PyMethod::Attribute(val) => (vm.ctx.none(), false, val),
-                };
-                // TODO: figure out a better way to communicate PyMethod::Attribute - CPython uses
-                // target==NULL, maybe we could use a sentinel value or something?
-                self.push_value(target);
-                self.push_value(vm.ctx.new_bool(is_method).into());
-                self.push_value(func);
-                Ok(None)
-            }
-            bytecode::Instruction::LoadNameAny(idx) => {
+            bytecode::Instruction::LoadName(idx) => {
                 let name = self.code.names[idx.get(arg) as usize];
                 let result = self.locals.mapping().subscript(name, vm);
                 match result {
@@ -1426,9 +1413,10 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             bytecode::Instruction::Nop => Ok(None),
-            // PopBlock is now a pseudo-instruction - exception table handles this
-            bytecode::Instruction::PopBlock => Ok(None),
-            bytecode::Instruction::PopException => {
+            bytecode::Instruction::PopBlock => {
+                unreachable!("PopBlock is converted to Nop during compilation")
+            }
+            bytecode::Instruction::PopExcept => {
                 // Pop prev_exc from value stack and restore it
                 let prev_exc = self.pop_value();
                 if vm.is_none(&prev_exc) {
@@ -1457,7 +1445,12 @@ impl ExecutingFrame<'_> {
                 self.pop_value();
                 Ok(None)
             }
-            bytecode::Instruction::Raise { kind } => self.execute_raise(vm, kind.get(arg)),
+            bytecode::Instruction::PushNull => {
+                // Push NULL for self_or_null slot in call protocol
+                self.push_null();
+                Ok(None)
+            }
+            bytecode::Instruction::RaiseVarargs { kind } => self.execute_raise(vm, kind.get(arg)),
             bytecode::Instruction::Resume { arg: resume_arg } => {
                 // Resume execution after yield, await, or at function start
                 // In CPython, this checks instrumentation and eval breaker
@@ -1477,11 +1470,6 @@ impl ExecutingFrame<'_> {
             bytecode::Instruction::ReturnValue => {
                 let value = self.pop_value();
                 self.unwind_blocks(vm, UnwindReason::Returning { value })
-            }
-            bytecode::Instruction::Reverse { amount } => {
-                let stack_len = self.state.stack.len();
-                self.state.stack[stack_len - amount.get(arg) as usize..stack_len].reverse();
-                Ok(None)
             }
             bytecode::Instruction::SetAdd { i } => {
                 let item = self.pop_value();
@@ -1559,7 +1547,7 @@ impl ExecutingFrame<'_> {
             bytecode::Instruction::SetFunctionAttribute { attr } => {
                 self.execute_set_function_attribute(vm, attr.get(arg))
             }
-            bytecode::Instruction::SetupAnnotation => self.setup_annotations(vm),
+            bytecode::Instruction::SetupAnnotations => self.setup_annotations(vm),
             bytecode::Instruction::BeforeWith => {
                 // TOS: context_manager
                 // Result: [..., __exit__, __enter__ result]
@@ -1621,13 +1609,13 @@ impl ExecutingFrame<'_> {
                     .set_item(self.code.names[idx.get(arg) as usize], value, vm)?;
                 Ok(None)
             }
-            bytecode::Instruction::StoreLocal(idx) => {
+            bytecode::Instruction::StoreName(idx) => {
                 let name = self.code.names[idx.get(arg) as usize];
                 let value = self.pop_value();
                 self.locals.mapping().ass_subscript(name, Some(value), vm)?;
                 Ok(None)
             }
-            bytecode::Instruction::StoreSubscript => self.execute_store_subscript(vm),
+            bytecode::Instruction::StoreSubscr => self.execute_store_subscript(vm),
             bytecode::Instruction::Subscript => self.execute_subscript(vm),
             bytecode::Instruction::Swap { index } => {
                 let len = self.state.stack.len();
@@ -1666,7 +1654,10 @@ impl ExecutingFrame<'_> {
                 let exc = vm.current_exception();
 
                 let stack_len = self.state.stack.len();
-                let exit = self.state.stack[stack_len - 4].clone();
+                let exit = expect_unchecked(
+                    self.state.stack[stack_len - 4].clone(),
+                    "WithExceptStart: __exit__ is NULL",
+                );
 
                 let args = if let Some(ref exc) = exc {
                     vm.split_exception(exc.clone())
@@ -1779,50 +1770,8 @@ impl ExecutingFrame<'_> {
                 self.push_value(vm.ctx.new_bool(!value).into());
                 Ok(None)
             }
-            // Placeholder/dummy instructions - these should never be executed
-            bytecode::Instruction::Cache
-            | bytecode::Instruction::Reserved3
-            | bytecode::Instruction::Reserved17
-            | bytecode::Instruction::BinarySlice
-            | bytecode::Instruction::EndFor
-            | bytecode::Instruction::ExitInitCheck
-            | bytecode::Instruction::InterpreterExit
-            | bytecode::Instruction::LoadAssertionError
-            | bytecode::Instruction::LoadLocals
-            | bytecode::Instruction::PushNull
-            | bytecode::Instruction::ReturnGenerator
-            | bytecode::Instruction::StoreSlice
-            | bytecode::Instruction::BuildConstKeyMap { .. }
-            | bytecode::Instruction::CopyFreeVars { .. }
-            | bytecode::Instruction::DictMerge { .. }
-            | bytecode::Instruction::EnterExecutor { .. }
-            | bytecode::Instruction::JumpBackward { .. }
-            | bytecode::Instruction::JumpBackwardNoInterrupt { .. }
-            | bytecode::Instruction::JumpForward { .. }
-            | bytecode::Instruction::ListExtend { .. }
-            | bytecode::Instruction::LoadFastCheck(_)
-            | bytecode::Instruction::LoadFastLoadFast { .. }
-            | bytecode::Instruction::LoadFromDictOrDeref(_)
-            | bytecode::Instruction::LoadFromDictOrGlobals(_)
-            | bytecode::Instruction::LoadSuperAttr { .. }
-            | bytecode::Instruction::MakeCell(_)
-            | bytecode::Instruction::PopJumpIfNone { .. }
-            | bytecode::Instruction::PopJumpIfNotNone { .. }
-            | bytecode::Instruction::SetUpdate { .. }
-            | bytecode::Instruction::StoreFastStoreFast { .. }
-            | bytecode::Instruction::Reserved140
-            | bytecode::Instruction::Reserved141
-            | bytecode::Instruction::Reserved142
-            | bytecode::Instruction::Reserved143
-            | bytecode::Instruction::Reserved144
-            | bytecode::Instruction::Reserved145
-            | bytecode::Instruction::Reserved146
-            | bytecode::Instruction::Reserved147
-            | bytecode::Instruction::Reserved148 => {
-                unreachable!(
-                    "placeholder instruction should not be executed: {:?}",
-                    instruction
-                )
+            _ => {
+                unreachable!("{instruction:?} instruction should not be executed")
             }
         }
     }
@@ -1951,7 +1900,7 @@ impl ExecutingFrame<'_> {
                 {
                     // 1. Pop stack to entry.depth
                     while self.state.stack.len() > entry.depth as usize {
-                        self.pop_value();
+                        self.state.stack.pop();
                     }
 
                     // 2. If push_lasti=true (SETUP_CLEANUP), push lasti before exception
@@ -2174,31 +2123,25 @@ impl ExecutingFrame<'_> {
 
     #[inline]
     fn execute_call(&mut self, args: FuncArgs, vm: &VirtualMachine) -> FrameResult {
-        let func_ref = self.pop_value();
-        let value = func_ref.call(args, vm)?;
-        self.push_value(value);
-        Ok(None)
-    }
+        // Stack: [callable, self_or_null, ...]
+        let self_or_null = self.pop_value_opt(); // Option<PyObjectRef>
+        let callable = self.pop_value();
 
-    #[inline]
-    fn execute_method_call(&mut self, args: FuncArgs, vm: &VirtualMachine) -> FrameResult {
-        let func = self.pop_value();
-        let is_method = self.pop_value().is(&vm.ctx.true_value);
-        let target = self.pop_value();
-
-        // TODO: It was PyMethod before #4873. Check if it's correct.
-        let func = if is_method {
-            if let Some(descr_get) = func.class().slots.descr_get.load() {
-                let cls = target.class().to_owned().into();
-                descr_get(func, Some(target), Some(cls), vm)?
-            } else {
-                func
+        // If self_or_null is Some (not NULL), prepend it to args
+        let final_args = if let Some(self_val) = self_or_null {
+            // Method call: prepend self to args
+            let mut all_args = vec![self_val];
+            all_args.extend(args.args);
+            FuncArgs {
+                args: all_args,
+                kwargs: args.kwargs,
             }
         } else {
-            drop(target); // should be None
-            func
+            // Regular attribute call: self_or_null is NULL
+            args
         };
-        let value = func.call(args, vm)?;
+
+        let value = callable.call(final_args, vm)?;
         self.push_value(value);
         Ok(None)
     }
@@ -2295,14 +2238,16 @@ impl ExecutingFrame<'_> {
         // Elements on stack from right-to-left:
         self.state
             .stack
-            .extend(elements.drain(before + middle..).rev());
+            .extend(elements.drain(before + middle..).rev().map(Some));
 
         let middle_elements = elements.drain(before..).collect();
         let t = vm.ctx.new_list(middle_elements);
         self.push_value(t.into());
 
         // Lastly the first reversed values:
-        self.state.stack.extend(elements.into_iter().rev());
+        self.state
+            .stack
+            .extend(elements.into_iter().rev().map(Some));
 
         Ok(None)
     }
@@ -2395,8 +2340,8 @@ impl ExecutingFrame<'_> {
         // Stack: [..., attr_value, func] -> [..., func]
         // Stack order: func is at -1, attr_value is at -2
 
-        let func = self.pop_value();
-        let attr_value = self.replace_top(func);
+        let func = self.pop_value_opt();
+        let attr_value = expect_unchecked(self.replace_top(func), "attr_value must not be null");
 
         let func = self.top_value();
         // Get the function reference and call the new method
@@ -2492,7 +2437,10 @@ impl ExecutingFrame<'_> {
         })?;
         let msg = match elements.len().cmp(&(size as usize)) {
             core::cmp::Ordering::Equal => {
-                self.state.stack.extend(elements.into_iter().rev());
+                // Wrap each element in Some() for Option<PyObjectRef> stack
+                self.state
+                    .stack
+                    .extend(elements.into_iter().rev().map(Some));
                 return Ok(None);
             }
             core::cmp::Ordering::Greater => {
@@ -2553,11 +2501,29 @@ impl ExecutingFrame<'_> {
         Ok(None)
     }
 
-    fn load_attr(&mut self, vm: &VirtualMachine, attr: bytecode::NameIdx) -> FrameResult {
-        let attr_name = self.code.names[attr as usize];
+    fn load_attr(&mut self, vm: &VirtualMachine, oparg: u32) -> FrameResult {
+        let (name_idx, is_method) = bytecode::decode_load_attr_arg(oparg);
+        let attr_name = self.code.names[name_idx as usize];
         let parent = self.pop_value();
-        let obj = parent.get_attr(attr_name, vm)?;
-        self.push_value(obj);
+
+        if is_method {
+            // Method call: push [method, self_or_null]
+            let method = PyMethod::get(parent.clone(), attr_name, vm)?;
+            match method {
+                PyMethod::Function { target: _, func } => {
+                    self.push_value(func);
+                    self.push_value(parent);
+                }
+                PyMethod::Attribute(val) => {
+                    self.push_value(val);
+                    self.push_null();
+                }
+            }
+        } else {
+            // Regular attribute access
+            let obj = parent.get_attr(attr_name, vm)?;
+            self.push_value(obj);
+        }
         Ok(None)
     }
 
@@ -2579,13 +2545,8 @@ impl ExecutingFrame<'_> {
     // Block stack functions removed - exception table handles all exception/cleanup
 
     #[inline]
-    #[track_caller] // not a real track_caller but push_value is not very useful
-    fn push_value(&mut self, obj: PyObjectRef) {
-        // eprintln!(
-        //     "push_value {} / len: {} +1",
-        //     obj.class().name(),
-        //     self.state.stack.len()
-        // );
+    #[track_caller] // not a real track_caller but push_value is less useful for debugging
+    fn push_value_opt(&mut self, obj: Option<PyObjectRef>) {
         match self.state.stack.try_push(obj) {
             Ok(()) => {}
             Err(_e) => self.fatal("tried to push value onto stack but overflowed max_stackdepth"),
@@ -2593,19 +2554,32 @@ impl ExecutingFrame<'_> {
     }
 
     #[inline]
-    #[track_caller] // not a real track_caller but pop_value is not very useful
-    fn pop_value(&mut self) -> PyObjectRef {
+    #[track_caller]
+    fn push_value(&mut self, obj: PyObjectRef) {
+        self.push_value_opt(Some(obj));
+    }
+
+    #[inline]
+    fn push_null(&mut self) {
+        self.push_value_opt(None);
+    }
+
+    /// Pop a value from the stack, returning None if the stack slot is NULL
+    #[inline]
+    fn pop_value_opt(&mut self) -> Option<PyObjectRef> {
         match self.state.stack.pop() {
-            Some(x) => {
-                // eprintln!(
-                //     "pop_value {} / len: {}",
-                //     x.class().name(),
-                //     self.state.stack.len()
-                // );
-                x
-            }
-            None => self.fatal("tried to pop value but there was nothing on the stack"),
+            Some(slot) => slot, // slot is Option<PyObjectRef>
+            None => self.fatal("tried to pop from empty stack"),
         }
+    }
+
+    #[inline]
+    #[track_caller]
+    fn pop_value(&mut self) -> PyObjectRef {
+        expect_unchecked(
+            self.pop_value_opt(),
+            "pop value but null found. This is a compiler bug.",
+        )
     }
 
     fn call_intrinsic_1(
@@ -2733,7 +2707,8 @@ impl ExecutingFrame<'_> {
         }
     }
 
-    fn pop_multiple(&mut self, count: usize) -> crate::common::boxvec::Drain<'_, PyObjectRef> {
+    /// Pop multiple values from the stack. Panics if any slot is NULL.
+    fn pop_multiple(&mut self, count: usize) -> impl ExactSizeIterator<Item = PyObjectRef> + '_ {
         let stack_len = self.state.stack.len();
         if count > stack_len {
             let instr = self.code.instructions.get(self.lasti() as usize);
@@ -2750,21 +2725,24 @@ impl ExecutingFrame<'_> {
                 self.code.source_path
             );
         }
-        self.state.stack.drain(stack_len - count..)
+        self.state.stack.drain(stack_len - count..).map(|obj| {
+            expect_unchecked(obj, "pop_multiple but null found. This is a compiler bug.")
+        })
     }
 
     #[inline]
-    fn replace_top(&mut self, mut top: PyObjectRef) -> PyObjectRef {
+    fn replace_top(&mut self, mut top: Option<PyObjectRef>) -> Option<PyObjectRef> {
         let last = self.state.stack.last_mut().unwrap();
-        core::mem::swap(&mut top, last);
+        core::mem::swap(last, &mut top);
         top
     }
 
     #[inline]
-    #[track_caller] // not a real track_caller but top_value is not very useful
+    #[track_caller]
     fn top_value(&self) -> &PyObject {
         match &*self.state.stack {
-            [.., last] => last,
+            [.., Some(last)] => last,
+            [.., None] => self.fatal("tried to get top of stack but got NULL"),
             [] => self.fatal("tried to get top of stack but stack is empty"),
         }
     }
@@ -2773,7 +2751,10 @@ impl ExecutingFrame<'_> {
     #[track_caller]
     fn nth_value(&self, depth: u32) -> &PyObject {
         let stack = &self.state.stack;
-        &stack[stack.len() - depth as usize - 1]
+        match &stack[stack.len() - depth as usize - 1] {
+            Some(obj) => obj,
+            None => unsafe { std::hint::unreachable_unchecked() },
+        }
     }
 
     #[cold]
@@ -2788,11 +2769,17 @@ impl ExecutingFrame<'_> {
 impl fmt::Debug for Frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.state.lock();
-        let stack_str = state.stack.iter().fold(String::new(), |mut s, elem| {
-            if elem.downcastable::<Self>() {
-                s.push_str("\n  > {frame}");
-            } else {
-                core::fmt::write(&mut s, format_args!("\n  > {elem:?}")).unwrap();
+        let stack_str = state.stack.iter().fold(String::new(), |mut s, slot| {
+            match slot {
+                Some(elem) if elem.downcastable::<Self>() => {
+                    s.push_str("\n  > {frame}");
+                }
+                Some(elem) => {
+                    core::fmt::write(&mut s, format_args!("\n  > {elem:?}")).unwrap();
+                }
+                None => {
+                    s.push_str("\n  > NULL");
+                }
             }
             s
         });
@@ -2818,4 +2805,12 @@ fn is_module_initializing(module: &PyObject, vm: &VirtualMachine) -> bool {
         return false;
     };
     initializing_attr.try_to_bool(vm).unwrap_or(false)
+}
+
+fn expect_unchecked(optional: Option<PyObjectRef>, err_msg: &'static str) -> PyObjectRef {
+    if cfg!(debug_assertions) {
+        optional.expect(err_msg)
+    } else {
+        unsafe { optional.unwrap_unchecked() }
+    }
 }
