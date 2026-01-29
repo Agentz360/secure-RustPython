@@ -53,8 +53,6 @@ class TimeTestCase(unittest.TestCase):
     def setUp(self):
         self.t = time.time()
 
-    # TODO: RUSTPYTHON, AttributeError: module 'time' has no attribute 'altzone'
-    @unittest.expectedFailure
     def test_data_attributes(self):
         time.altzone
         time.daylight
@@ -622,7 +620,6 @@ class _TestAsctimeYear:
         self.assertEqual(self.yearstr(12345), '12345')
         self.assertEqual(self.yearstr(123456789), '123456789')
 
-@unittest.skip("TODO: RUSTPYTHON, ValueError: invalid struct_time parameter")
 class _TestStrftimeYear:
 
     # Issue 13305:  For years < 1000, the value is not always

@@ -1,8 +1,30 @@
 use crate::{Py, PyResult, VirtualMachine, builtins::PyModule, convert::ToPyObject};
 
-pub(crate) use sys::{
-    __module_def, DOC, MAXSIZE, RUST_MULTIARCH, UnraisableHookArgsData, multiarch,
-};
+pub(crate) use sys::{DOC, MAXSIZE, RUST_MULTIARCH, UnraisableHookArgsData, module_def, multiarch};
+
+#[pymodule(name = "_jit")]
+mod sys_jit {
+    /// Return True if the current Python executable supports JIT compilation,
+    /// and False otherwise.
+    #[pyfunction]
+    const fn is_available() -> bool {
+        false // RustPython has no JIT
+    }
+
+    /// Return True if JIT compilation is enabled for the current Python process,
+    /// and False otherwise.
+    #[pyfunction]
+    const fn is_enabled() -> bool {
+        false // RustPython has no JIT
+    }
+
+    /// Return True if the topmost Python frame is currently executing JIT code,
+    /// and False otherwise.
+    #[pyfunction]
+    const fn is_active() -> bool {
+        false // RustPython has no JIT
+    }
+}
 
 #[pymodule]
 mod sys {
@@ -52,8 +74,11 @@ mod sys {
     #[pyattr(name = "_rustpython_debugbuild")]
     const RUSTPYTHON_DEBUGBUILD: bool = cfg!(debug_assertions);
 
+    #[cfg(not(windows))]
     #[pyattr(name = "abiflags")]
-    pub(crate) const ABIFLAGS: &str = "t"; // 't' for free-threaded (no GIL)
+    const ABIFLAGS_ATTR: &str = "t"; // 't' for free-threaded (no GIL)
+    // Internal constant used for sysconfigdata_name
+    pub const ABIFLAGS: &str = "t";
     #[pyattr(name = "api_version")]
     const API_VERSION: u32 = 0x0; // what C api?
     #[pyattr(name = "copyright")]
@@ -69,7 +94,7 @@ mod sys {
     #[pyattr(name = "maxunicode")]
     const MAXUNICODE: u32 = core::char::MAX as u32;
     #[pyattr(name = "platform")]
-    pub(crate) const PLATFORM: &str = {
+    pub const PLATFORM: &str = {
         cfg_if::cfg_if! {
             if #[cfg(target_os = "linux")] {
                 "linux"
@@ -121,6 +146,10 @@ mod sys {
     fn platlibdir(_vm: &VirtualMachine) -> &'static str {
         option_env!("RUSTPYTHON_PLATLIBDIR").unwrap_or("lib")
     }
+    #[pyattr]
+    fn _stdlib_dir(vm: &VirtualMachine) -> PyObjectRef {
+        vm.state.config.paths.stdlib_dir.clone().to_pyobject(vm)
+    }
 
     // alphabetical order with segments of pyattr and others
 
@@ -137,9 +166,11 @@ mod sys {
 
     #[pyattr]
     fn builtin_module_names(vm: &VirtualMachine) -> PyTupleRef {
-        let mut module_names: Vec<_> = vm.state.module_inits.keys().cloned().collect();
-        module_names.push("sys".into());
-        module_names.push("builtins".into());
+        let mut module_names: Vec<String> =
+            vm.state.module_defs.keys().map(|&s| s.to_owned()).collect();
+        module_names.push("sys".to_owned());
+        module_names.push("builtins".to_owned());
+
         module_names.sort();
         vm.ctx.new_tuple(
             module_names
@@ -503,6 +534,7 @@ mod sys {
             "_multiarch" => ctx.new_str(multiarch()),
             "version" => version_info(vm),
             "hexversion" => ctx.new_int(version::VERSION_HEX),
+            "supports_isolated_interpreters" => ctx.new_bool(false),
         })
     }
 
@@ -602,6 +634,12 @@ mod sys {
     #[pyfunction]
     const fn _is_gil_enabled() -> bool {
         false // RustPython has no GIL (like free-threaded Python)
+    }
+
+    /// Return True if remote debugging is enabled, False otherwise.
+    #[pyfunction]
+    const fn is_remote_debug_enabled() -> bool {
+        false // RustPython does not support remote debugging
     }
 
     #[pyfunction]
@@ -1182,6 +1220,32 @@ mod sys {
     }
 
     #[pyfunction]
+    fn _clear_type_descriptors(type_obj: PyTypeRef, vm: &VirtualMachine) -> PyResult<()> {
+        use crate::types::PyTypeFlags;
+
+        // Check if type is immutable
+        if type_obj.slots.flags.has_feature(PyTypeFlags::IMMUTABLETYPE) {
+            return Err(vm.new_type_error("argument is immutable".to_owned()));
+        }
+
+        let mut attributes = type_obj.attributes.write();
+
+        // Remove __dict__ descriptor if present
+        attributes.swap_remove(identifier!(vm, __dict__));
+
+        // Remove __weakref__ descriptor if present
+        attributes.swap_remove(identifier!(vm, __weakref__));
+
+        drop(attributes);
+
+        // Update slots to notify subclasses and recalculate cached values
+        type_obj.update_slot::<true>(identifier!(vm, __dict__), &vm.ctx);
+        type_obj.update_slot::<true>(identifier!(vm, __weakref__), &vm.ctx);
+
+        Ok(())
+    }
+
+    #[pyfunction]
     fn getswitchinterval(vm: &VirtualMachine) -> f64 {
         // Return the stored switch interval
         vm.state.switch_interval.load()
@@ -1301,6 +1365,10 @@ mod sys {
         safe_path: bool,
         /// -X warn_default_encoding, PYTHONWARNDEFAULTENCODING
         warn_default_encoding: u8,
+        /// -X thread_inherit_context, whether new threads inherit context from parent
+        thread_inherit_context: bool,
+        /// -X context_aware_warnings, whether warnings are context aware
+        context_aware_warnings: bool,
     }
 
     impl FlagsData {
@@ -1324,6 +1392,8 @@ mod sys {
                 int_max_str_digits: settings.int_max_str_digits,
                 safe_path: settings.safe_path,
                 warn_default_encoding: settings.warn_default_encoding as u8,
+                thread_inherit_context: settings.thread_inherit_context,
+                context_aware_warnings: settings.context_aware_warnings,
             }
         }
     }
@@ -1539,7 +1609,8 @@ mod sys {
 }
 
 pub(crate) fn init_module(vm: &VirtualMachine, module: &Py<PyModule>, builtins: &Py<PyModule>) {
-    sys::extend_module(vm, module).unwrap();
+    module.__init_methods(vm).unwrap();
+    sys::module_exec(vm, module).unwrap();
 
     let modules = vm.ctx.new_dict();
     modules
@@ -1548,9 +1619,15 @@ pub(crate) fn init_module(vm: &VirtualMachine, module: &Py<PyModule>, builtins: 
     modules
         .set_item("builtins", builtins.to_owned().into(), vm)
         .unwrap();
+
+    // Create sys._jit submodule
+    let jit_def = sys_jit::module_def(&vm.ctx);
+    let jit_module = jit_def.create_module(vm).unwrap();
+
     extend_module!(vm, module, {
         "__doc__" => sys::DOC.to_owned().to_pyobject(vm),
         "modules" => modules,
+        "_jit" => jit_module,
     });
 }
 

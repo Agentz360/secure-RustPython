@@ -2,6 +2,8 @@
 
 use super::*;
 use crate::common::ascii;
+use crate::function::FuncArgs;
+use crate::types::Initializer;
 
 macro_rules! impl_node {
     (
@@ -449,11 +451,67 @@ impl_node!(
 );
 
 impl_node!(
-    #[pyclass(module = "_ast", name = "Constant", base = NodeExpr)]
-    pub(crate) struct NodeExprConstant,
-    fields: ["value", "kind"],
+    #[pyclass(module = "_ast", name = "TemplateStr", base = NodeExpr)]
+    pub(crate) struct NodeExprTemplateStr,
+    fields: ["values"],
     attributes: ["lineno", "col_offset", "end_lineno", "end_col_offset"],
 );
+
+impl_node!(
+    #[pyclass(module = "_ast", name = "Interpolation", base = NodeExpr)]
+    pub(crate) struct NodeExprInterpolation,
+    fields: ["value", "str", "conversion", "format_spec"],
+    attributes: ["lineno", "col_offset", "end_lineno", "end_col_offset"],
+);
+
+// NodeExprConstant needs custom Initializer to default kind to None
+#[pyclass(module = "_ast", name = "Constant", base = NodeExpr)]
+#[repr(transparent)]
+pub(crate) struct NodeExprConstant(NodeExpr);
+
+#[pyclass(flags(HAS_DICT, BASETYPE), with(Initializer))]
+impl NodeExprConstant {
+    #[extend_class]
+    fn extend_class_with_fields(ctx: &Context, class: &'static Py<PyType>) {
+        class.set_attr(
+            identifier!(ctx, _fields),
+            ctx.new_tuple(vec![
+                ctx.new_str(ascii!("value")).into(),
+                ctx.new_str(ascii!("kind")).into(),
+            ])
+            .into(),
+        );
+
+        class.set_attr(
+            identifier!(ctx, _attributes),
+            ctx.new_list(vec![
+                ctx.new_str(ascii!("lineno")).into(),
+                ctx.new_str(ascii!("col_offset")).into(),
+                ctx.new_str(ascii!("end_lineno")).into(),
+                ctx.new_str(ascii!("end_col_offset")).into(),
+            ])
+            .into(),
+        );
+    }
+}
+
+impl Initializer for NodeExprConstant {
+    type Args = FuncArgs;
+
+    fn slot_init(zelf: PyObjectRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult<()> {
+        <NodeAst as Initializer>::slot_init(zelf.clone(), args, vm)?;
+        // kind defaults to None if not provided
+        let dict = zelf.as_object().dict().unwrap();
+        if !dict.contains_key("kind", vm) {
+            dict.set_item("kind", vm.ctx.none(), vm)?;
+        }
+        Ok(())
+    }
+
+    fn init(_zelf: PyRef<Self>, _args: Self::Args, _vm: &VirtualMachine) -> PyResult<()> {
+        unreachable!("slot_init is defined")
+    }
+}
 
 impl_node!(
     #[pyclass(module = "_ast", name = "Attribute", base = NodeExpr)]
@@ -918,6 +976,8 @@ pub fn extend_module_nodes(vm: &VirtualMachine, module: &Py<PyModule>) {
         "Call" => NodeExprCall::make_class(&vm.ctx),
         "FormattedValue" => NodeExprFormattedValue::make_class(&vm.ctx),
         "JoinedStr" => NodeExprJoinedStr::make_class(&vm.ctx),
+        "TemplateStr" => NodeExprTemplateStr::make_class(&vm.ctx),
+        "Interpolation" => NodeExprInterpolation::make_class(&vm.ctx),
         "Constant" => NodeExprConstant::make_class(&vm.ctx),
         "Attribute" => NodeExprAttribute::make_class(&vm.ctx),
         "Subscript" => NodeExprSubscript::make_class(&vm.ctx),

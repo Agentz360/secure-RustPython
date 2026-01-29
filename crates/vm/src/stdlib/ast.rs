@@ -1,14 +1,16 @@
 //! `ast` standard module for abstract syntax trees.
+
 //!
 //! This module makes use of the parser logic, and translates all ast nodes
 //! into python ast.AST objects.
+
+pub(crate) use python::_ast::module_def;
 
 mod pyast;
 
 use crate::builtins::{PyInt, PyStr};
 use crate::stdlib::ast::module::{Mod, ModInteractive};
 use crate::stdlib::ast::node::BoxedSlice;
-use crate::stdlib::ast::python::_ast;
 use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyRefExact, PyResult,
     TryFromObject, VirtualMachine,
@@ -19,7 +21,7 @@ use crate::{
     convert::ToPyObject,
 };
 use node::Node;
-use ruff_python_ast as ruff;
+use ruff_python_ast as ast;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustpython_compiler_core::{
     LineIndex, OneIndexed, PositionEncoding, SourceFile, SourceFileBuilder, SourceLocation,
@@ -283,8 +285,8 @@ pub(crate) fn parse(
         })?
         .into_syntax();
     let top = match top {
-        ruff::Mod::Module(m) => Mod::Module(m),
-        ruff::Mod::Expression(e) => Mod::Expression(e),
+        ast::Mod::Module(m) => Mod::Module(m),
+        ast::Mod::Expression(e) => Mod::Expression(e),
     };
     Ok(top.ast_to_object(vm, &source_file))
 }
@@ -305,13 +307,13 @@ pub(crate) fn compile(
     let source_file = SourceFileBuilder::new(filename.to_owned(), "".to_owned()).finish();
     let ast: Mod = Node::ast_from_object(vm, &source_file, object)?;
     let ast = match ast {
-        Mod::Module(m) => ruff::Mod::Module(m),
-        Mod::Interactive(ModInteractive { range, body }) => ruff::Mod::Module(ruff::ModModule {
+        Mod::Module(m) => ast::Mod::Module(m),
+        Mod::Interactive(ModInteractive { range, body }) => ast::Mod::Module(ast::ModModule {
             node_index: Default::default(),
             range,
             body,
         }),
-        Mod::Expression(e) => ruff::Mod::Expression(e),
+        Mod::Expression(e) => ast::Mod::Expression(e),
         Mod::FunctionType(_) => todo!(),
     };
     // TODO: create a textual representation of the ast
@@ -365,9 +367,3 @@ pub const PY_COMPILE_FLAGS_MASK: i32 = PY_COMPILE_FLAG_AST_ONLY
     | CO_FUTURE_BARRY_AS_BDFL
     | CO_FUTURE_GENERATOR_STOP
     | CO_FUTURE_ANNOTATIONS;
-
-pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
-    let module = _ast::make_module(vm);
-    pyast::extend_module_nodes(vm, &module);
-    module
-}

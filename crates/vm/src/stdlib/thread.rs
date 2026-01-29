@@ -1,15 +1,17 @@
 //! Implementation of the _thread module
+#[cfg(unix)]
+pub(crate) use _thread::after_fork_child;
 #[cfg_attr(target_arch = "wasm32", allow(unused_imports))]
 pub(crate) use _thread::{
-    CurrentFrameSlot, HandleEntry, RawRMutex, ShutdownEntry, after_fork_child,
-    get_all_current_frames, get_ident, init_main_thread_ident, make_module,
+    CurrentFrameSlot, HandleEntry, RawRMutex, ShutdownEntry, get_all_current_frames, get_ident,
+    init_main_thread_ident, module_def,
 };
 
 #[pymodule]
 pub(crate) mod _thread {
     use crate::{
         AsObject, Py, PyPayload, PyRef, PyResult, VirtualMachine,
-        builtins::{PyDictRef, PyStr, PyTupleRef, PyType, PyTypeRef},
+        builtins::{PyDictRef, PyStr, PyStrRef, PyTupleRef, PyType, PyTypeRef},
         frame::FrameRef,
         function::{ArgCallable, Either, FuncArgs, KwArgs, OptionalArg, PySetterValue},
         types::{Constructor, GetAttr, Representable, SetAttr},
@@ -261,6 +263,11 @@ pub(crate) mod _thread {
         }
 
         #[pymethod]
+        fn locked(&self) -> bool {
+            self.mu.is_locked()
+        }
+
+        #[pymethod]
         fn _is_owned(&self) -> bool {
             self.mu.is_owned_by_current_thread()
         }
@@ -291,6 +298,47 @@ pub(crate) mod _thread {
     #[pyfunction]
     pub fn get_ident() -> u64 {
         current_thread_id()
+    }
+
+    /// Set the name of the current thread
+    #[pyfunction]
+    fn set_name(name: PyStrRef) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            if let Ok(c_name) = CString::new(name.as_str()) {
+                // pthread_setname_np on Linux has a 16-byte limit including null terminator
+                // TODO: Potential UTF-8 boundary issue when truncating thread name on Linux.
+                // https://github.com/RustPython/RustPython/pull/6726/changes#r2689379171
+                let truncated = if c_name.as_bytes().len() > 15 {
+                    CString::new(&c_name.as_bytes()[..15]).unwrap_or(c_name)
+                } else {
+                    c_name
+                };
+                unsafe {
+                    libc::pthread_setname_np(libc::pthread_self(), truncated.as_ptr());
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::CString;
+            if let Ok(c_name) = CString::new(name.as_str()) {
+                unsafe {
+                    libc::pthread_setname_np(c_name.as_ptr());
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Windows doesn't have a simple pthread_setname_np equivalent
+            // SetThreadDescription requires Windows 10+
+            let _ = name;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            let _ = name;
+        }
     }
 
     /// Get OS-level thread ID (pthread_self on Unix)
@@ -373,14 +421,14 @@ pub(crate) mod _thread {
                 vm.new_thread()
                     .make_spawn_func(move |vm| run_thread(func, args, vm)),
             )
-            .map(|handle| {
-                vm.state.thread_count.fetch_add(1);
-                thread_to_id(&handle)
-            })
+            .map(|handle| thread_to_id(&handle))
             .map_err(|err| vm.new_runtime_error(format!("can't start new thread: {err}")))
     }
 
     fn run_thread(func: ArgCallable, args: FuncArgs, vm: &VirtualMachine) {
+        // Increment thread count when thread actually starts executing
+        vm.state.thread_count.fetch_add(1);
+
         match func.invoke(args, vm) {
             Ok(_obj) => {}
             Err(e) if e.fast_isinstance(vm.ctx.exceptions.system_exit) => {}
@@ -470,7 +518,7 @@ pub(crate) mod _thread {
                 let mut handles = vm.state.shutdown_handles.lock();
                 // Clean up finished entries
                 handles.retain(|(inner_weak, _): &ShutdownEntry| {
-                    inner_weak.upgrade().map_or(false, |inner| {
+                    inner_weak.upgrade().is_some_and(|inner| {
                         let guard = inner.lock();
                         guard.state != ThreadHandleState::Done && guard.ident != current_ident
                     })
@@ -836,6 +884,7 @@ pub(crate) mod _thread {
 
     /// Called after fork() in child process to mark all other threads as done.
     /// This prevents join() from hanging on threads that don't exist in the child.
+    #[cfg(unix)]
     pub fn after_fork_child(vm: &VirtualMachine) {
         let current_ident = get_ident();
 
@@ -885,6 +934,50 @@ pub(crate) mod _thread {
                 }
 
                 true
+            });
+        }
+
+        // Clean up shutdown_handles as well.
+        // This is critical to prevent _shutdown() from waiting on threads
+        // that don't exist in the child process after fork.
+        if let Some(mut handles) = vm.state.shutdown_handles.try_lock() {
+            // Mark all non-current threads as done in shutdown_handles
+            handles.retain(|(inner_weak, done_event_weak): &ShutdownEntry| {
+                let Some(inner) = inner_weak.upgrade() else {
+                    return false; // Remove dead entries
+                };
+                let Some(done_event) = done_event_weak.upgrade() else {
+                    return false;
+                };
+
+                // Try to lock the inner state - skip if we can't
+                let Some(mut inner_guard) = inner.try_lock() else {
+                    return false;
+                };
+
+                // Skip current thread
+                if inner_guard.ident == current_ident {
+                    return true;
+                }
+
+                // Keep handles for threads that have not been started yet.
+                // They are safe to start in the child process.
+                if inner_guard.state == ThreadHandleState::NotStarted {
+                    return true;
+                }
+
+                // Mark as done so _shutdown() won't wait on it
+                inner_guard.state = ThreadHandleState::Done;
+                drop(inner_guard);
+
+                // Notify waiters
+                let (lock, cvar) = &*done_event;
+                if let Some(mut done) = lock.try_lock() {
+                    *done = true;
+                    cvar.notify_all();
+                }
+
+                false // Remove from shutdown_handles - these threads don't exist in child
             });
         }
     }
@@ -1119,13 +1212,6 @@ pub(crate) mod _thread {
                     // Mark as done
                     inner_for_cleanup.lock().state = ThreadHandleState::Done;
 
-                    // Signal waiting threads that this thread is done
-                    {
-                        let (lock, cvar) = &*done_event_for_cleanup;
-                        *lock.lock() = true;
-                        cvar.notify_all();
-                    }
-
                     // Handle sentinels
                     for lock in SENTINELS.take() {
                         if lock.mu.is_locked() {
@@ -1140,7 +1226,18 @@ pub(crate) mod _thread {
                     crate::vm::thread::cleanup_current_thread_frames(vm);
 
                     vm_state.thread_count.fetch_sub(1);
+
+                    // Signal waiting threads that this thread is done
+                    // This must be LAST to ensure all cleanup is complete before join() returns
+                    {
+                        let (lock, cvar) = &*done_event_for_cleanup;
+                        *lock.lock() = true;
+                        cvar.notify_all();
+                    }
                 }
+
+                // Increment thread count when thread actually starts executing
+                vm_state.thread_count.fetch_add(1);
 
                 // Run the function
                 match func.invoke((), vm) {
@@ -1156,8 +1253,6 @@ pub(crate) mod _thread {
                 }
             }))
             .map_err(|err| vm.new_runtime_error(format!("can't start new thread: {err}")))?;
-
-        vm.state.thread_count.fetch_add(1);
 
         // Store the join handle
         handle.inner.lock().join_handle = Some(join_handle);

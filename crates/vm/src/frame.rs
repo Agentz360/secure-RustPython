@@ -1,17 +1,21 @@
+#[cfg(feature = "flame")]
+use crate::bytecode::InstructionMetadata;
 use crate::{
     AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
     builtins::{
         PyBaseException, PyBaseExceptionRef, PyCode, PyCoroutine, PyDict, PyDictRef, PyGenerator,
-        PyList, PySet, PySlice, PyStr, PyStrInterned, PyStrRef, PyTraceback, PyType,
+        PyInterpolation, PyList, PySet, PySlice, PyStr, PyStrInterned, PyStrRef, PyTemplate,
+        PyTraceback, PyType,
         asyncgenerator::PyAsyncGenWrappedValue,
         function::{PyCell, PyCellRef, PyFunction},
         tuple::{PyTuple, PyTupleRef},
     },
-    bytecode,
+    bytecode::{self, Instruction},
     convert::{IntoObject, ToPyResult},
     coroutine::Coro,
     exceptions::ExceptionCtor,
     function::{ArgMapping, Either, FuncArgs},
+    object::{Traverse, TraverseFn},
     protocol::{PyIter, PyIterReturn},
     scope::Scope,
     stdlib::{builtins, typing},
@@ -24,6 +28,7 @@ use core::iter::zip;
 use core::sync::atomic;
 use indexmap::IndexMap;
 use itertools::Itertools;
+
 use rustpython_common::{boxvec::BoxVec, lock::PyMutex, wtf8::Wtf8Buf};
 use rustpython_compiler_core::SourceLocation;
 
@@ -40,13 +45,6 @@ enum UnwindReason {
     /// We hit an exception, so unwind any try-except and finally blocks. The exception should be
     /// on top of the vm exception stack.
     Raising { exception: PyBaseExceptionRef },
-
-    // NoWorries,
-    /// We are unwinding blocks, since we hit break
-    Break { target: bytecode::Label },
-
-    /// We are unwinding blocks since we hit a continue statements.
-    Continue { target: bytecode::Label },
 }
 
 #[derive(Debug)]
@@ -64,7 +62,7 @@ type Lasti = atomic::AtomicU32;
 #[cfg(not(feature = "threading"))]
 type Lasti = core::cell::Cell<u32>;
 
-#[pyclass(module = false, name = "frame")]
+#[pyclass(module = false, name = "frame", traverse = "manual")]
 pub struct Frame {
     pub code: PyRef<PyCode>,
     pub func_obj: Option<PyObjectRef>,
@@ -95,6 +93,27 @@ impl PyPayload for Frame {
     }
 }
 
+unsafe impl Traverse for FrameState {
+    fn traverse(&self, tracer_fn: &mut TraverseFn<'_>) {
+        self.stack.traverse(tracer_fn);
+    }
+}
+
+unsafe impl Traverse for Frame {
+    fn traverse(&self, tracer_fn: &mut TraverseFn<'_>) {
+        self.code.traverse(tracer_fn);
+        self.func_obj.traverse(tracer_fn);
+        self.fastlocals.traverse(tracer_fn);
+        self.cells_frees.traverse(tracer_fn);
+        self.locals.traverse(tracer_fn);
+        self.globals.traverse(tracer_fn);
+        self.builtins.traverse(tracer_fn);
+        self.trace.traverse(tracer_fn);
+        self.state.traverse(tracer_fn);
+        self.temporary_refs.traverse(tracer_fn);
+    }
+}
+
 // Running a frame can result in one of the below:
 pub enum ExecutionResult {
     Return(PyObjectRef),
@@ -113,10 +132,24 @@ impl Frame {
         func_obj: Option<PyObjectRef>,
         vm: &VirtualMachine,
     ) -> Self {
-        let cells_frees = core::iter::repeat_with(|| PyCell::default().into_ref(&vm.ctx))
-            .take(code.cellvars.len())
-            .chain(closure.iter().cloned())
-            .collect();
+        let nlocals = code.varnames.len();
+        let num_cells = code.cellvars.len();
+        let nfrees = closure.len();
+
+        let cells_frees: Box<[PyCellRef]> =
+            core::iter::repeat_with(|| PyCell::default().into_ref(&vm.ctx))
+                .take(num_cells)
+                .chain(closure.iter().cloned())
+                .collect();
+
+        // Extend fastlocals to include varnames + cellvars + freevars (localsplus)
+        let total_locals = nlocals + num_cells + nfrees;
+        let mut fastlocals_vec: Vec<Option<PyObjectRef>> = vec![None; total_locals];
+
+        // Store cell objects at cellvars and freevars positions
+        for (i, cell) in cells_frees.iter().enumerate() {
+            fastlocals_vec[nlocals + i] = Some(cell.clone().into());
+        }
 
         let state = FrameState {
             stack: BoxVec::new(code.max_stackdepth as usize),
@@ -125,7 +158,7 @@ impl Frame {
         };
 
         Self {
-            fastlocals: PyMutex::new(vec![None; code.varnames.len()].into_boxed_slice()),
+            fastlocals: PyMutex::new(fastlocals_vec.into_boxed_slice()),
             cells_frees,
             locals: scope.locals,
             globals: scope.globals,
@@ -387,15 +420,15 @@ impl ExecutingFrame<'_> {
                     }
 
                     // Check if this is a RERAISE instruction
-                    // Both Instruction::Raise { kind: Reraise/ReraiseFromStack } and
-                    // Instruction::Reraise are reraise operations that should not add
+                    // Both AnyInstruction::Raise { kind: Reraise/ReraiseFromStack } and
+                    // AnyInstruction::Reraise are reraise operations that should not add
                     // new traceback entries
                     let is_reraise = match op {
-                        bytecode::Instruction::RaiseVarargs { kind } => matches!(
+                        Instruction::RaiseVarargs { kind } => matches!(
                             kind.get(arg),
                             bytecode::RaiseKind::BareRaise | bytecode::RaiseKind::ReraiseFromStack
                         ),
-                        bytecode::Instruction::Reraise { .. } => true,
+                        Instruction::Reraise { .. } => true,
                         _ => false,
                     };
 
@@ -439,13 +472,13 @@ impl ExecutingFrame<'_> {
         let lasti = self.lasti() as usize;
         if let Some(unit) = self.code.instructions.get(lasti) {
             match &unit.op {
-                bytecode::Instruction::Send { .. } => return Some(self.top_value()),
-                bytecode::Instruction::Resume { .. } => {
+                Instruction::Send { .. } => return Some(self.top_value()),
+                Instruction::Resume { .. } => {
                     // Check if previous instruction was YIELD_VALUE with arg >= 1
                     // This indicates yield-from/await context
                     if lasti > 0
                         && let Some(prev_unit) = self.code.instructions.get(lasti - 1)
-                        && let bytecode::Instruction::YieldValue { .. } = &prev_unit.op
+                        && let Instruction::YieldValue { .. } = &prev_unit.op
                     {
                         // YIELD_VALUE arg: 0 = direct yield, >= 1 = yield-from/await
                         // OpArgByte.0 is the raw byte value
@@ -550,7 +583,7 @@ impl ExecutingFrame<'_> {
     #[inline(always)]
     fn execute_instruction(
         &mut self,
-        instruction: bytecode::Instruction,
+        instruction: Instruction,
         arg: bytecode::OpArg,
         extend_arg: &mut bool,
         vm: &VirtualMachine,
@@ -584,76 +617,37 @@ impl ExecutingFrame<'_> {
         }
 
         match instruction {
-            bytecode::Instruction::BeforeAsyncWith => {
-                let mgr = self.pop_value();
-                let error_string = || -> String {
-                    format!(
-                        "'{:.200}' object does not support the asynchronous context manager protocol",
-                        mgr.class().name(),
-                    )
-                };
-
-                let aenter_res = vm
-                    .get_special_method(&mgr, identifier!(vm, __aenter__))?
-                    .ok_or_else(|| vm.new_type_error(error_string()))?
-                    .invoke((), vm)?;
-                let aexit = mgr
-                    .get_attr(identifier!(vm, __aexit__), vm)
-                    .map_err(|_exc| {
-                        vm.new_type_error({
-                            format!("{} (missed __aexit__ method)", error_string())
-                        })
-                    })?;
-                self.push_value(aexit);
-                self.push_value(aenter_res);
-
-                Ok(None)
+            Instruction::BinaryOp { op } => self.execute_bin_op(vm, op.get(arg)),
+            // TODO: In CPython, this does in-place unicode concatenation when
+            // refcount is 1. Falls back to regular iadd for now.
+            Instruction::BinaryOpInplaceAddUnicode => {
+                self.execute_bin_op(vm, bytecode::BinaryOperator::InplaceAdd)
             }
-            bytecode::Instruction::BinaryOp { op } => self.execute_bin_op(vm, op.get(arg)),
-            bytecode::Instruction::BinarySubscr => {
-                let key = self.pop_value();
+            Instruction::BinarySlice => {
+                // Stack: [container, start, stop] -> [result]
+                let stop = self.pop_value();
+                let start = self.pop_value();
                 let container = self.pop_value();
-                let result = container.get_item(key.as_object(), vm)?;
+                let slice: PyObjectRef = PySlice {
+                    start: Some(start),
+                    stop,
+                    step: None,
+                }
+                .into_ref(&vm.ctx)
+                .into();
+                let result = container.get_item(&*slice, vm)?;
                 self.push_value(result);
                 Ok(None)
             }
-
-            bytecode::Instruction::Break { target } => self.unwind_blocks(
-                vm,
-                UnwindReason::Break {
-                    target: target.get(arg),
-                },
-            ),
-            bytecode::Instruction::BuildListFromTuples { size } => {
-                // SAFETY: compiler guarantees `size` tuples are on the stack
-                let elements = unsafe { self.flatten_tuples(size.get(arg) as usize) };
+            Instruction::BuildList { size } => {
+                let sz = size.get(arg) as usize;
+                let elements = self.pop_multiple(sz).collect();
                 let list_obj = vm.ctx.new_list(elements);
                 self.push_value(list_obj.into());
                 Ok(None)
             }
-            bytecode::Instruction::BuildList { size } => {
-                let elements = self.pop_multiple(size.get(arg) as usize).collect();
-                let list_obj = vm.ctx.new_list(elements);
-                self.push_value(list_obj.into());
-                Ok(None)
-            }
-            bytecode::Instruction::BuildMapForCall { size } => {
-                self.execute_build_map_for_call(vm, size.get(arg))
-            }
-            bytecode::Instruction::BuildMap { size } => self.execute_build_map(vm, size.get(arg)),
-            bytecode::Instruction::BuildSetFromTuples { size } => {
-                let set = PySet::default().into_ref(&vm.ctx);
-                for element in self.pop_multiple(size.get(arg) as usize) {
-                    // SAFETY: trust compiler
-                    let tup = unsafe { element.downcast_unchecked::<PyTuple>() };
-                    for item in tup.iter() {
-                        set.add(item.clone(), vm)?;
-                    }
-                }
-                self.push_value(set.into());
-                Ok(None)
-            }
-            bytecode::Instruction::BuildSet { size } => {
+            Instruction::BuildMap { size } => self.execute_build_map(vm, size.get(arg)),
+            Instruction::BuildSet { size } => {
                 let set = PySet::default().into_ref(&vm.ctx);
                 for element in self.pop_multiple(size.get(arg) as usize) {
                     set.add(element, vm)?;
@@ -661,11 +655,9 @@ impl ExecutingFrame<'_> {
                 self.push_value(set.into());
                 Ok(None)
             }
-            bytecode::Instruction::BuildSlice { argc } => {
-                self.execute_build_slice(vm, argc.get(arg))
-            }
+            Instruction::BuildSlice { argc } => self.execute_build_slice(vm, argc.get(arg)),
             /*
-             bytecode::Instruction::ToBool => {
+             Instruction::ToBool => {
                  dbg!("Shouldn't be called outside of match statements for now")
                  let value = self.pop_value();
                  // call __bool__
@@ -674,7 +666,7 @@ impl ExecutingFrame<'_> {
                  Ok(None)
             }
             */
-            bytecode::Instruction::BuildString { size } => {
+            Instruction::BuildString { size } => {
                 let s: Wtf8Buf = self
                     .pop_multiple(size.get(arg) as usize)
                     .map(|pyobj| pyobj.downcast::<PyStr>().unwrap())
@@ -682,66 +674,110 @@ impl ExecutingFrame<'_> {
                 self.push_value(vm.ctx.new_str(s).into());
                 Ok(None)
             }
-            bytecode::Instruction::BuildTupleFromIter => {
-                if !self.top_value().class().is(vm.ctx.types.tuple_type) {
-                    let elements: Vec<_> = self.pop_value().try_to_value(vm)?;
-                    let list_obj = vm.ctx.new_tuple(elements);
-                    self.push_value(list_obj.into());
-                }
-                Ok(None)
-            }
-            bytecode::Instruction::BuildTupleFromTuples { size } => {
-                // SAFETY: compiler guarantees `size` tuples are on the stack
-                let elements = unsafe { self.flatten_tuples(size.get(arg) as usize) };
-                let list_obj = vm.ctx.new_tuple(elements);
-                self.push_value(list_obj.into());
-                Ok(None)
-            }
-            bytecode::Instruction::BuildTuple { size } => {
+            Instruction::BuildTuple { size } => {
                 let elements = self.pop_multiple(size.get(arg) as usize).collect();
                 let list_obj = vm.ctx.new_tuple(elements);
                 self.push_value(list_obj.into());
                 Ok(None)
             }
-            bytecode::Instruction::Call { nargs } => {
+            Instruction::BuildTemplate => {
+                // Stack: [strings_tuple, interpolations_tuple] -> [template]
+                let interpolations = self.pop_value();
+                let strings = self.pop_value();
+
+                let strings = strings
+                    .downcast::<PyTuple>()
+                    .map_err(|_| vm.new_type_error("BUILD_TEMPLATE expected tuple for strings"))?;
+                let interpolations = interpolations.downcast::<PyTuple>().map_err(|_| {
+                    vm.new_type_error("BUILD_TEMPLATE expected tuple for interpolations")
+                })?;
+
+                let template = PyTemplate::new(strings, interpolations);
+                self.push_value(template.into_pyobject(vm));
+                Ok(None)
+            }
+            Instruction::BuildInterpolation { oparg } => {
+                // oparg encoding: (conversion << 2) | has_format_spec
+                // Stack: [value, expression_str, (format_spec)?] -> [interpolation]
+                let oparg_val = oparg.get(arg);
+                let has_format_spec = (oparg_val & 1) != 0;
+                let conversion_code = oparg_val >> 2;
+
+                let format_spec = if has_format_spec {
+                    self.pop_value().downcast::<PyStr>().map_err(|_| {
+                        vm.new_type_error("BUILD_INTERPOLATION expected str for format_spec")
+                    })?
+                } else {
+                    vm.ctx.empty_str.to_owned()
+                };
+
+                let expression = self.pop_value().downcast::<PyStr>().map_err(|_| {
+                    vm.new_type_error("BUILD_INTERPOLATION expected str for expression")
+                })?;
+                let value = self.pop_value();
+
+                // conversion: 0=None, 1=Str, 2=Repr, 3=Ascii
+                let conversion: PyObjectRef = match conversion_code {
+                    0 => vm.ctx.none(),
+                    1 => vm.ctx.new_str("s").into(),
+                    2 => vm.ctx.new_str("r").into(),
+                    3 => vm.ctx.new_str("a").into(),
+                    _ => vm.ctx.none(), // should not happen
+                };
+
+                let interpolation =
+                    PyInterpolation::new(value, expression, conversion, format_spec, vm)?;
+                self.push_value(interpolation.into_pyobject(vm));
+                Ok(None)
+            }
+            Instruction::Call { nargs } => {
                 // Stack: [callable, self_or_null, arg1, ..., argN]
                 let args = self.collect_positional_args(nargs.get(arg));
                 self.execute_call(args, vm)
             }
-            bytecode::Instruction::CallKw { nargs } => {
+            Instruction::CallKw { nargs } => {
                 // Stack: [callable, self_or_null, arg1, ..., argN, kwarg_names]
                 let args = self.collect_keyword_args(nargs.get(arg));
                 self.execute_call(args, vm)
             }
-            bytecode::Instruction::CallFunctionEx { has_kwargs } => {
-                // Stack: [callable, self_or_null, args_tuple, (kwargs_dict)?]
-                let args = self.collect_ex_args(vm, has_kwargs.get(arg))?;
+            Instruction::CallFunctionEx => {
+                // Stack: [callable, self_or_null, args_tuple, kwargs_or_null]
+                let args = self.collect_ex_args(vm)?;
                 self.execute_call(args, vm)
             }
-            bytecode::Instruction::CallIntrinsic1 { func } => {
+            Instruction::CallIntrinsic1 { func } => {
                 let value = self.pop_value();
                 let result = self.call_intrinsic_1(func.get(arg), value, vm)?;
                 self.push_value(result);
                 Ok(None)
             }
-            bytecode::Instruction::CallIntrinsic2 { func } => {
+            Instruction::CallIntrinsic2 { func } => {
                 let value2 = self.pop_value();
                 let value1 = self.pop_value();
                 let result = self.call_intrinsic_2(func.get(arg), value1, value2, vm)?;
                 self.push_value(result);
                 Ok(None)
             }
-            bytecode::Instruction::CheckEgMatch => {
+            Instruction::CheckEgMatch => {
                 let match_type = self.pop_value();
                 let exc_value = self.pop_value();
                 let (rest, matched) =
                     crate::exceptions::exception_group_match(&exc_value, &match_type, vm)?;
+
+                // Set matched exception as current exception (if not None)
+                // This mirrors CPython's PyErr_SetHandledException(match_o) in CHECK_EG_MATCH
+                if !vm.is_none(&matched)
+                    && let Some(exc) = matched.downcast_ref::<PyBaseException>()
+                {
+                    vm.set_exception(Some(exc.to_owned()));
+                }
+
                 self.push_value(rest);
                 self.push_value(matched);
                 Ok(None)
             }
-            bytecode::Instruction::CompareOp { op } => self.execute_compare(vm, op.get(arg)),
-            bytecode::Instruction::ContainsOp(invert) => {
+            Instruction::CompareOp { op } => self.execute_compare(vm, op.get(arg)),
+            Instruction::ContainsOp(invert) => {
                 let b = self.pop_value();
                 let a = self.pop_value();
 
@@ -752,17 +788,10 @@ impl ExecutingFrame<'_> {
                 self.push_value(vm.ctx.new_bool(value).into());
                 Ok(None)
             }
-            bytecode::Instruction::Continue { target } => self.unwind_blocks(
-                vm,
-                UnwindReason::Continue {
-                    target: target.get(arg),
-                },
-            ),
-
-            bytecode::Instruction::ConvertValue { oparg: conversion } => {
+            Instruction::ConvertValue { oparg: conversion } => {
                 self.convert_value(conversion.get(arg), vm)
             }
-            bytecode::Instruction::Copy { index } => {
+            Instruction::Copy { index } => {
                 // CopyItem { index: 1 } copies TOS
                 // CopyItem { index: 2 } copies second from top
                 // This is 1-indexed to match CPython
@@ -778,12 +807,16 @@ impl ExecutingFrame<'_> {
                 self.push_value_opt(value);
                 Ok(None)
             }
-            bytecode::Instruction::DeleteAttr { idx } => self.delete_attr(vm, idx.get(arg)),
-            bytecode::Instruction::DeleteDeref(i) => {
+            Instruction::CopyFreeVars { .. } => {
+                // Free vars are already set up at frame creation time in RustPython
+                Ok(None)
+            }
+            Instruction::DeleteAttr { idx } => self.delete_attr(vm, idx.get(arg)),
+            Instruction::DeleteDeref(i) => {
                 self.cells_frees[i.get(arg) as usize].set(None);
                 Ok(None)
             }
-            bytecode::Instruction::DeleteFast(idx) => {
+            Instruction::DeleteFast(idx) => {
                 let mut fastlocals = self.fastlocals.lock();
                 let idx = idx.get(arg) as usize;
                 if fastlocals[idx].is_none() {
@@ -798,7 +831,7 @@ impl ExecutingFrame<'_> {
                 fastlocals[idx] = None;
                 Ok(None)
             }
-            bytecode::Instruction::DeleteGlobal(idx) => {
+            Instruction::DeleteGlobal(idx) => {
                 let name = self.code.names[idx.get(arg) as usize];
                 match self.globals.del_item(name, vm) {
                     Ok(()) => {}
@@ -809,7 +842,7 @@ impl ExecutingFrame<'_> {
                 }
                 Ok(None)
             }
-            bytecode::Instruction::DeleteName(idx) => {
+            Instruction::DeleteName(idx) => {
                 let name = self.code.names[idx.get(arg) as usize];
                 let res = self.locals.mapping().ass_subscript(name, None, vm);
 
@@ -822,8 +855,8 @@ impl ExecutingFrame<'_> {
                 }
                 Ok(None)
             }
-            bytecode::Instruction::DeleteSubscr => self.execute_delete_subscript(vm),
-            bytecode::Instruction::DictUpdate { index } => {
+            Instruction::DeleteSubscr => self.execute_delete_subscript(vm),
+            Instruction::DictUpdate { index } => {
                 // Stack before: [..., dict, ..., source]  (source at TOS)
                 // Stack after:  [..., dict, ...]  (source consumed)
                 // The dict to update is at position TOS-i (before popping source)
@@ -859,7 +892,49 @@ impl ExecutingFrame<'_> {
                 dict.merge_object(source, vm)?;
                 Ok(None)
             }
-            bytecode::Instruction::EndAsyncFor => {
+            Instruction::DictMerge { index } => {
+                let source = self.pop_value();
+                let idx = index.get(arg);
+
+                // Get the dict to merge into (same logic as DICT_UPDATE)
+                let dict_ref = if idx <= 1 {
+                    self.top_value()
+                } else {
+                    self.nth_value(idx - 1)
+                };
+
+                let dict: &Py<PyDict> = unsafe { dict_ref.downcast_unchecked_ref() };
+
+                // Check if source is a mapping
+                if vm
+                    .get_method(source.clone(), vm.ctx.intern_str("keys"))
+                    .is_none()
+                {
+                    return Err(vm.new_type_error(format!(
+                        "'{}' object is not a mapping",
+                        source.class().name()
+                    )));
+                }
+
+                // Check for duplicate keys
+                let keys_iter = vm.call_method(&source, "keys", ())?;
+                for key in keys_iter.try_to_value::<Vec<PyObjectRef>>(vm)? {
+                    if key.downcast_ref::<PyStr>().is_none() {
+                        return Err(vm.new_type_error("keywords must be strings".to_owned()));
+                    }
+                    if dict.contains_key(&*key, vm) {
+                        let key_repr = key.repr(vm)?;
+                        return Err(vm.new_type_error(format!(
+                            "got multiple values for keyword argument {}",
+                            key_repr.as_str()
+                        )));
+                    }
+                    let value = vm.call_method(&source, "__getitem__", (key.clone(),))?;
+                    dict.set_item(&*key, value, vm)?;
+                }
+                Ok(None)
+            }
+            Instruction::EndAsyncFor => {
                 // END_ASYNC_FOR pops (awaitable, exc) from stack
                 // Stack: [awaitable, exc] -> []
                 // exception_unwind pushes exception to stack before jumping to handler
@@ -879,19 +954,19 @@ impl ExecutingFrame<'_> {
                     Err(exc)
                 }
             }
-            bytecode::Instruction::ExtendedArg => {
+            Instruction::ExtendedArg => {
                 *extend_arg = true;
                 Ok(None)
             }
-            bytecode::Instruction::ForIter { target } => self.execute_for_iter(vm, target.get(arg)),
-            bytecode::Instruction::FormatSimple => {
+            Instruction::ForIter { target } => self.execute_for_iter(vm, target.get(arg)),
+            Instruction::FormatSimple => {
                 let value = self.pop_value();
                 let formatted = vm.format(&value, vm.ctx.new_str(""))?;
                 self.push_value(formatted.into());
 
                 Ok(None)
             }
-            bytecode::Instruction::FormatWithSpec => {
+            Instruction::FormatWithSpec => {
                 let spec = self.pop_value();
                 let value = self.pop_value();
                 let formatted = vm.format(&value, spec.downcast::<PyStr>().unwrap())?;
@@ -899,13 +974,13 @@ impl ExecutingFrame<'_> {
 
                 Ok(None)
             }
-            bytecode::Instruction::GetAIter => {
+            Instruction::GetAIter => {
                 let aiterable = self.pop_value();
                 let aiter = vm.call_special_method(&aiterable, identifier!(vm, __aiter__), ())?;
                 self.push_value(aiter);
                 Ok(None)
             }
-            bytecode::Instruction::GetANext => {
+            Instruction::GetANext => {
                 #[cfg(debug_assertions)] // remove when GetANext is fully implemented
                 let orig_stack_len = self.state.stack.len();
 
@@ -950,7 +1025,7 @@ impl ExecutingFrame<'_> {
                 debug_assert_eq!(orig_stack_len + 1, self.state.stack.len());
                 Ok(None)
             }
-            bytecode::Instruction::GetAwaitable => {
+            Instruction::GetAwaitable => {
                 use crate::protocol::PyIter;
 
                 let awaited_obj = self.pop_value();
@@ -961,6 +1036,20 @@ impl ExecutingFrame<'_> {
                             vm.new_runtime_error("coroutine is being awaited already".to_owned())
                         );
                     }
+                    awaited_obj
+                } else if awaited_obj
+                    .downcast_ref::<PyGenerator>()
+                    .is_some_and(|generator| {
+                        generator
+                            .as_coro()
+                            .frame()
+                            .code
+                            .flags
+                            .contains(bytecode::CodeFlags::ITERABLE_COROUTINE)
+                    })
+                {
+                    // Generator with CO_ITERABLE_COROUTINE flag can be awaited
+                    // (e.g., generators decorated with @types.coroutine)
                     awaited_obj
                 } else {
                     let await_method = vm.get_method_or_type_error(
@@ -986,13 +1075,13 @@ impl ExecutingFrame<'_> {
                 self.push_value(awaitable);
                 Ok(None)
             }
-            bytecode::Instruction::GetIter => {
+            Instruction::GetIter => {
                 let iterated_obj = self.pop_value();
                 let iter_obj = iterated_obj.get_iter(vm)?;
                 self.push_value(iter_obj.into());
                 Ok(None)
             }
-            bytecode::Instruction::GetYieldFromIter => {
+            Instruction::GetYieldFromIter => {
                 // GET_YIELD_FROM_ITER: prepare iterator for yield from
                 // If iterable is a coroutine, ensure we're in a coroutine context
                 // If iterable is a generator, use it directly
@@ -1000,7 +1089,9 @@ impl ExecutingFrame<'_> {
                 let iterable = self.pop_value();
                 let iter = if iterable.class().is(vm.ctx.types.coroutine_type) {
                     // Coroutine requires CO_COROUTINE or CO_ITERABLE_COROUTINE flag
-                    if !self.code.flags.intersects(bytecode::CodeFlags::COROUTINE) {
+                    if !self.code.flags.intersects(
+                        bytecode::CodeFlags::COROUTINE | bytecode::CodeFlags::ITERABLE_COROUTINE,
+                    ) {
                         return Err(vm.new_type_error(
                             "cannot 'yield from' a coroutine object in a non-coroutine generator"
                                 .to_owned(),
@@ -1017,23 +1108,23 @@ impl ExecutingFrame<'_> {
                 self.push_value(iter);
                 Ok(None)
             }
-            bytecode::Instruction::GetLen => {
+            Instruction::GetLen => {
                 // STACK.append(len(STACK[-1]))
                 let obj = self.top_value();
                 let len = obj.length(vm)?;
                 self.push_value(vm.ctx.new_int(len).into());
                 Ok(None)
             }
-            bytecode::Instruction::ImportFrom { idx } => {
+            Instruction::ImportFrom { idx } => {
                 let obj = self.import_from(vm, idx.get(arg))?;
                 self.push_value(obj);
                 Ok(None)
             }
-            bytecode::Instruction::ImportName { idx } => {
+            Instruction::ImportName { idx } => {
                 self.import(vm, Some(self.code.names[idx.get(arg) as usize]))?;
                 Ok(None)
             }
-            bytecode::Instruction::IsOp(invert) => {
+            Instruction::IsOp(invert) => {
                 let b = self.pop_value();
                 let a = self.pop_value();
                 let res = a.is(&b);
@@ -1045,52 +1136,19 @@ impl ExecutingFrame<'_> {
                 self.push_value(vm.ctx.new_bool(value).into());
                 Ok(None)
             }
-            bytecode::Instruction::JumpIfFalseOrPop { target } => {
-                self.jump_if_or_pop(vm, target.get(arg), false)
-            }
-            bytecode::Instruction::JumpIfNotExcMatch(target) => {
-                let b = self.pop_value();
-                let a = self.pop_value();
-                if let Some(tuple_of_exceptions) = b.downcast_ref::<PyTuple>() {
-                    for exception in tuple_of_exceptions {
-                        if !exception
-                            .is_subclass(vm.ctx.exceptions.base_exception_type.into(), vm)?
-                        {
-                            return Err(vm.new_type_error(
-                                "catching classes that do not inherit from BaseException is not allowed",
-                            ));
-                        }
-                    }
-                } else if !b.is_subclass(vm.ctx.exceptions.base_exception_type.into(), vm)? {
-                    return Err(vm.new_type_error(
-                        "catching classes that do not inherit from BaseException is not allowed",
-                    ));
-                }
-
-                let value = a.is_instance(&b, vm)?;
-                self.push_value(vm.ctx.new_bool(value).into());
-                self.pop_jump_if(vm, target.get(arg), false)
-            }
-            bytecode::Instruction::JumpIfTrueOrPop { target } => {
-                self.jump_if_or_pop(vm, target.get(arg), true)
-            }
-            bytecode::Instruction::Jump { target } => {
+            Instruction::JumpForward { target } => {
                 self.jump(target.get(arg));
                 Ok(None)
             }
-            bytecode::Instruction::JumpForward { target } => {
+            Instruction::JumpBackward { target } => {
                 self.jump(target.get(arg));
                 Ok(None)
             }
-            bytecode::Instruction::JumpBackward { target } => {
+            Instruction::JumpBackwardNoInterrupt { target } => {
                 self.jump(target.get(arg));
                 Ok(None)
             }
-            bytecode::Instruction::JumpBackwardNoInterrupt { target } => {
-                self.jump(target.get(arg));
-                Ok(None)
-            }
-            bytecode::Instruction::ListAppend { i } => {
+            Instruction::ListAppend { i } => {
                 let item = self.pop_value();
                 let obj = self.nth_value(i.get(arg));
                 let list: &Py<PyList> = unsafe {
@@ -1100,30 +1158,47 @@ impl ExecutingFrame<'_> {
                 list.append(item);
                 Ok(None)
             }
-            bytecode::Instruction::LoadAttr { idx } => self.load_attr(vm, idx.get(arg)),
-            bytecode::Instruction::LoadAttrMethod { .. } => {
-                unreachable!("LoadAttrMethod is converted to LoadAttr during compilation")
+            Instruction::ListExtend { i } => {
+                let iterable = self.pop_value();
+                let obj = self.nth_value(i.get(arg));
+                let list: &Py<PyList> = unsafe {
+                    // SAFETY: compiler guarantees correct type
+                    obj.downcast_unchecked_ref()
+                };
+                list.extend(iterable, vm)?;
+                Ok(None)
             }
-            bytecode::Instruction::LoadSuperAttr { arg: idx } => {
-                self.load_super_attr(vm, idx.get(arg))
-            }
-            bytecode::Instruction::LoadSuperMethod { .. }
-            | bytecode::Instruction::LoadZeroSuperAttr { .. }
-            | bytecode::Instruction::LoadZeroSuperMethod { .. } => {
-                unreachable!("LOAD_SUPER_* pseudo instructions are converted during compilation")
-            }
-            bytecode::Instruction::LoadBuildClass => {
+            Instruction::LoadAttr { idx } => self.load_attr(vm, idx.get(arg)),
+            Instruction::LoadSuperAttr { arg: idx } => self.load_super_attr(vm, idx.get(arg)),
+            Instruction::LoadBuildClass => {
                 self.push_value(vm.builtins.get_attr(identifier!(vm, __build_class__), vm)?);
                 Ok(None)
             }
-            bytecode::Instruction::LoadFromDictOrDeref(i) => {
+            Instruction::LoadLocals => {
+                // Push the locals dict onto the stack
+                let locals = self.locals.clone().into_object();
+                self.push_value(locals);
+                Ok(None)
+            }
+            Instruction::LoadFromDictOrDeref(i) => {
+                // Pop dict from stack (locals or classdict depending on context)
+                let class_dict = self.pop_value();
                 let i = i.get(arg) as usize;
                 let name = if i < self.code.cellvars.len() {
                     self.code.cellvars[i]
                 } else {
                     self.code.freevars[i - self.code.cellvars.len()]
                 };
-                let value = self.locals.mapping().subscript(name, vm).ok();
+                // Only treat KeyError as "not found", propagate other exceptions
+                let value = if let Some(dict_obj) = class_dict.downcast_ref::<PyDict>() {
+                    dict_obj.get_item_opt(name, vm)?
+                } else {
+                    match class_dict.get_item(name, vm) {
+                        Ok(v) => Some(v),
+                        Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => None,
+                        Err(e) => return Err(e),
+                    }
+                };
                 self.push_value(match value {
                     Some(v) => v,
                     None => self.cells_frees[i]
@@ -1132,24 +1207,64 @@ impl ExecutingFrame<'_> {
                 });
                 Ok(None)
             }
-            bytecode::Instruction::LoadClosure(i) => {
-                let value = self.cells_frees[i.get(arg) as usize].clone();
-                self.push_value(value.into());
+            Instruction::LoadFromDictOrGlobals(idx) => {
+                // PEP 649: Pop dict from stack (classdict), check there first, then globals
+                let dict = self.pop_value();
+                let name = self.code.names[idx.get(arg) as usize];
+
+                // Only treat KeyError as "not found", propagate other exceptions
+                let value = if let Some(dict_obj) = dict.downcast_ref::<PyDict>() {
+                    dict_obj.get_item_opt(name, vm)?
+                } else {
+                    // Not an exact dict, use mapping protocol
+                    match dict.get_item(name, vm) {
+                        Ok(v) => Some(v),
+                        Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => None,
+                        Err(e) => return Err(e),
+                    }
+                };
+
+                self.push_value(match value {
+                    Some(v) => v,
+                    None => self.load_global_or_builtin(name, vm)?,
+                });
                 Ok(None)
             }
-            bytecode::Instruction::LoadConst { idx } => {
+            Instruction::LoadConst { idx } => {
                 self.push_value(self.code.constants[idx.get(arg) as usize].clone().into());
                 Ok(None)
             }
-            bytecode::Instruction::LoadDeref(i) => {
-                let i = i.get(arg) as usize;
-                let x = self.cells_frees[i]
+            Instruction::LoadCommonConstant { idx } => {
+                use bytecode::CommonConstant;
+                let value = match idx.get(arg) {
+                    CommonConstant::AssertionError => {
+                        vm.ctx.exceptions.assertion_error.to_owned().into()
+                    }
+                    CommonConstant::NotImplementedError => {
+                        vm.ctx.exceptions.not_implemented_error.to_owned().into()
+                    }
+                    CommonConstant::BuiltinTuple => vm.ctx.types.tuple_type.to_owned().into(),
+                    CommonConstant::BuiltinAll => vm.builtins.get_attr("all", vm)?,
+                    CommonConstant::BuiltinAny => vm.builtins.get_attr("any", vm)?,
+                };
+                self.push_value(value);
+                Ok(None)
+            }
+            Instruction::LoadSmallInt { idx } => {
+                // Push small integer (-5..=256) directly without constant table lookup
+                let value = vm.ctx.new_int(idx.get(arg) as i32);
+                self.push_value(value.into());
+                Ok(None)
+            }
+            Instruction::LoadDeref(i) => {
+                let idx = i.get(arg) as usize;
+                let x = self.cells_frees[idx]
                     .get()
-                    .ok_or_else(|| self.unbound_cell_exception(i, vm))?;
+                    .ok_or_else(|| self.unbound_cell_exception(idx, vm))?;
                 self.push_value(x);
                 Ok(None)
             }
-            bytecode::Instruction::LoadFast(idx) => {
+            Instruction::LoadFast(idx) => {
                 #[cold]
                 fn reference_error(
                     varname: &'static PyStrInterned,
@@ -1167,7 +1282,7 @@ impl ExecutingFrame<'_> {
                 self.push_value(x);
                 Ok(None)
             }
-            bytecode::Instruction::LoadFastAndClear(idx) => {
+            Instruction::LoadFastAndClear(idx) => {
                 // Load value and clear the slot (for inlined comprehensions)
                 // If slot is empty, push None (not an error - variable may not exist yet)
                 let idx = idx.get(arg) as usize;
@@ -1177,13 +1292,110 @@ impl ExecutingFrame<'_> {
                 self.push_value(x);
                 Ok(None)
             }
-            bytecode::Instruction::LoadGlobal(idx) => {
+            Instruction::LoadFastCheck(idx) => {
+                // Same as LoadFast but explicitly checks for unbound locals
+                // (LoadFast in RustPython already does this check)
+                let idx = idx.get(arg) as usize;
+                let x = self.fastlocals.lock()[idx].clone().ok_or_else(|| {
+                    vm.new_exception_msg(
+                        vm.ctx.exceptions.unbound_local_error.to_owned(),
+                        format!(
+                            "local variable '{}' referenced before assignment",
+                            self.code.varnames[idx]
+                        ),
+                    )
+                })?;
+                self.push_value(x);
+                Ok(None)
+            }
+            Instruction::LoadFastLoadFast { arg: packed } => {
+                // Load two local variables at once
+                // oparg encoding: (idx1 << 4) | idx2
+                let oparg = packed.get(arg);
+                let idx1 = (oparg >> 4) as usize;
+                let idx2 = (oparg & 15) as usize;
+                let fastlocals = self.fastlocals.lock();
+                let x1 = fastlocals[idx1].clone().ok_or_else(|| {
+                    vm.new_exception_msg(
+                        vm.ctx.exceptions.unbound_local_error.to_owned(),
+                        format!(
+                            "local variable '{}' referenced before assignment",
+                            self.code.varnames[idx1]
+                        ),
+                    )
+                })?;
+                let x2 = fastlocals[idx2].clone().ok_or_else(|| {
+                    vm.new_exception_msg(
+                        vm.ctx.exceptions.unbound_local_error.to_owned(),
+                        format!(
+                            "local variable '{}' referenced before assignment",
+                            self.code.varnames[idx2]
+                        ),
+                    )
+                })?;
+                drop(fastlocals);
+                self.push_value(x1);
+                self.push_value(x2);
+                Ok(None)
+            }
+            // TODO: Implement true borrow optimization (skip Arc::clone).
+            // CPython's LOAD_FAST_BORROW uses PyStackRef_Borrow to avoid refcount
+            // increment for values that are consumed within the same basic block.
+            // Possible approaches:
+            // - Store raw pointers with careful lifetime management
+            // - Add a "borrowed" variant to stack slots
+            // - Use arena allocation for short-lived stack values
+            // Currently this just clones like LoadFast.
+            Instruction::LoadFastBorrow(idx) => {
+                let idx = idx.get(arg) as usize;
+                let x = self.fastlocals.lock()[idx].clone().ok_or_else(|| {
+                    vm.new_exception_msg(
+                        vm.ctx.exceptions.unbound_local_error.to_owned(),
+                        format!(
+                            "local variable '{}' referenced before assignment",
+                            self.code.varnames[idx]
+                        ),
+                    )
+                })?;
+                self.push_value(x);
+                Ok(None)
+            }
+            // TODO: Same as LoadFastBorrow - implement true borrow optimization.
+            Instruction::LoadFastBorrowLoadFastBorrow { arg: packed } => {
+                let oparg = packed.get(arg);
+                let idx1 = (oparg >> 4) as usize;
+                let idx2 = (oparg & 15) as usize;
+                let fastlocals = self.fastlocals.lock();
+                let x1 = fastlocals[idx1].clone().ok_or_else(|| {
+                    vm.new_exception_msg(
+                        vm.ctx.exceptions.unbound_local_error.to_owned(),
+                        format!(
+                            "local variable '{}' referenced before assignment",
+                            self.code.varnames[idx1]
+                        ),
+                    )
+                })?;
+                let x2 = fastlocals[idx2].clone().ok_or_else(|| {
+                    vm.new_exception_msg(
+                        vm.ctx.exceptions.unbound_local_error.to_owned(),
+                        format!(
+                            "local variable '{}' referenced before assignment",
+                            self.code.varnames[idx2]
+                        ),
+                    )
+                })?;
+                drop(fastlocals);
+                self.push_value(x1);
+                self.push_value(x2);
+                Ok(None)
+            }
+            Instruction::LoadGlobal(idx) => {
                 let name = &self.code.names[idx.get(arg) as usize];
                 let x = self.load_global_or_builtin(name, vm)?;
                 self.push_value(x);
                 Ok(None)
             }
-            bytecode::Instruction::LoadName(idx) => {
+            Instruction::LoadName(idx) => {
                 let name = self.code.names[idx.get(arg) as usize];
                 let result = self.locals.mapping().subscript(name, vm);
                 match result {
@@ -1195,8 +1407,46 @@ impl ExecutingFrame<'_> {
                 }
                 Ok(None)
             }
-            bytecode::Instruction::MakeFunction => self.execute_make_function(vm),
-            bytecode::Instruction::MapAdd { i } => {
+            Instruction::LoadSpecial { method } => {
+                // Stack effect: 0 (replaces TOS with bound method)
+                // Input: [..., obj]
+                // Output: [..., bound_method]
+                use crate::vm::PyMethod;
+                use bytecode::SpecialMethod;
+
+                let obj = self.pop_value();
+                let method_name = match method.get(arg) {
+                    SpecialMethod::Enter => identifier!(vm, __enter__),
+                    SpecialMethod::Exit => identifier!(vm, __exit__),
+                    SpecialMethod::AEnter => identifier!(vm, __aenter__),
+                    SpecialMethod::AExit => identifier!(vm, __aexit__),
+                };
+
+                let bound = match vm.get_special_method(&obj, method_name)? {
+                    Some(PyMethod::Function { target, func }) => {
+                        // Create bound method: PyBoundMethod(object=target, function=func)
+                        crate::builtins::PyBoundMethod::new(target, func)
+                            .into_ref(&vm.ctx)
+                            .into()
+                    }
+                    Some(PyMethod::Attribute(bound)) => bound,
+                    None => {
+                        return Err(vm.new_type_error(format!(
+                            "'{}' object does not support the context manager protocol (missed {} method)",
+                            obj.class().name(),
+                            method_name
+                        )));
+                    }
+                };
+                self.push_value(bound);
+                Ok(None)
+            }
+            Instruction::MakeFunction => self.execute_make_function(vm),
+            Instruction::MakeCell(_) => {
+                // Cell creation is handled at frame creation time in RustPython
+                Ok(None)
+            }
+            Instruction::MapAdd { i } => {
                 let value = self.pop_value();
                 let key = self.pop_value();
                 let obj = self.nth_value(i.get(arg));
@@ -1207,7 +1457,7 @@ impl ExecutingFrame<'_> {
                 dict.set_item(&*key, value, vm)?;
                 Ok(None)
             }
-            bytecode::Instruction::MatchClass(nargs) => {
+            Instruction::MatchClass(nargs) => {
                 // STACK[-1] is a tuple of keyword attribute names, STACK[-2] is the class being matched against, and STACK[-3] is the match subject.
                 // nargs is the number of positional sub-patterns.
                 let kwd_attrs = self.pop_value();
@@ -1328,7 +1578,7 @@ impl ExecutingFrame<'_> {
                 }
                 Ok(None)
             }
-            bytecode::Instruction::MatchKeys => {
+            Instruction::MatchKeys => {
                 // MATCH_KEYS doesn't pop subject and keys, only reads them
                 let keys_tuple = self.top_value(); // stack[-1]
                 let subject = self.nth_value(1); // stack[-2]
@@ -1394,7 +1644,7 @@ impl ExecutingFrame<'_> {
                 }
                 Ok(None)
             }
-            bytecode::Instruction::MatchMapping => {
+            Instruction::MatchMapping => {
                 // Pop and push back the subject to keep it on stack
                 let subject = self.pop_value();
 
@@ -1405,7 +1655,7 @@ impl ExecutingFrame<'_> {
                 self.push_value(vm.ctx.new_bool(is_mapping).into());
                 Ok(None)
             }
-            bytecode::Instruction::MatchSequence => {
+            Instruction::MatchSequence => {
                 // Pop and push back the subject to keep it on stack
                 let subject = self.pop_value();
 
@@ -1416,11 +1666,23 @@ impl ExecutingFrame<'_> {
                 self.push_value(vm.ctx.new_bool(is_sequence).into());
                 Ok(None)
             }
-            bytecode::Instruction::Nop => Ok(None),
-            bytecode::Instruction::PopBlock => {
-                unreachable!("PopBlock is converted to Nop during compilation")
+            Instruction::Nop => Ok(None),
+            // NOT_TAKEN is a branch prediction hint - functionally a NOP
+            Instruction::NotTaken => Ok(None),
+            // Instrumented version of NOT_TAKEN - NOP without monitoring
+            Instruction::InstrumentedNotTaken => Ok(None),
+            // CACHE is used by adaptive interpreter for inline caching - NOP for us
+            Instruction::Cache => Ok(None),
+            Instruction::ReturnGenerator => {
+                // In RustPython, generators/coroutines are created in function.rs
+                // before the frame starts executing. The RETURN_GENERATOR instruction
+                // pushes None so that the following POP_TOP has something to consume.
+                // This matches CPython's semantics where the sent value (None for first call)
+                // is on the stack when the generator resumes.
+                self.push_value(vm.ctx.none());
+                Ok(None)
             }
-            bytecode::Instruction::PopExcept => {
+            Instruction::PopExcept => {
                 // Pop prev_exc from value stack and restore it
                 let prev_exc = self.pop_value();
                 if vm.is_none(&prev_exc) {
@@ -1438,24 +1700,44 @@ impl ExecutingFrame<'_> {
 
                 Ok(None)
             }
-            bytecode::Instruction::PopJumpIfFalse { target } => {
-                self.pop_jump_if(vm, target.get(arg), false)
+            Instruction::PopJumpIfFalse { target } => self.pop_jump_if(vm, target.get(arg), false),
+            Instruction::PopJumpIfTrue { target } => self.pop_jump_if(vm, target.get(arg), true),
+            Instruction::PopJumpIfNone { target } => {
+                let value = self.pop_value();
+                if vm.is_none(&value) {
+                    self.jump(target.get(arg));
+                }
+                Ok(None)
             }
-            bytecode::Instruction::PopJumpIfTrue { target } => {
-                self.pop_jump_if(vm, target.get(arg), true)
+            Instruction::PopJumpIfNotNone { target } => {
+                let value = self.pop_value();
+                if !vm.is_none(&value) {
+                    self.jump(target.get(arg));
+                }
+                Ok(None)
             }
-            bytecode::Instruction::PopTop => {
+            Instruction::PopTop => {
                 // Pop value from stack and ignore.
                 self.pop_value();
                 Ok(None)
             }
-            bytecode::Instruction::PushNull => {
+            Instruction::EndFor => {
+                // Pop the next value from stack (cleanup after loop body)
+                self.pop_value();
+                Ok(None)
+            }
+            Instruction::PopIter => {
+                // Pop the iterator from stack (end of for loop)
+                self.pop_value();
+                Ok(None)
+            }
+            Instruction::PushNull => {
                 // Push NULL for self_or_null slot in call protocol
                 self.push_null();
                 Ok(None)
             }
-            bytecode::Instruction::RaiseVarargs { kind } => self.execute_raise(vm, kind.get(arg)),
-            bytecode::Instruction::Resume { arg: resume_arg } => {
+            Instruction::RaiseVarargs { kind } => self.execute_raise(vm, kind.get(arg)),
+            Instruction::Resume { arg: resume_arg } => {
                 // Resume execution after yield, await, or at function start
                 // In CPython, this checks instrumentation and eval breaker
                 // For now, we just check for signals/interrupts
@@ -1467,15 +1749,11 @@ impl ExecutingFrame<'_> {
                 // }
                 Ok(None)
             }
-            bytecode::Instruction::ReturnConst { idx } => {
-                let value = self.code.constants[idx.get(arg) as usize].clone().into();
-                self.unwind_blocks(vm, UnwindReason::Returning { value })
-            }
-            bytecode::Instruction::ReturnValue => {
+            Instruction::ReturnValue => {
                 let value = self.pop_value();
                 self.unwind_blocks(vm, UnwindReason::Returning { value })
             }
-            bytecode::Instruction::SetAdd { i } => {
+            Instruction::SetAdd { i } => {
                 let item = self.pop_value();
                 let obj = self.nth_value(i.get(arg));
                 let set: &Py<PySet> = unsafe {
@@ -1485,16 +1763,20 @@ impl ExecutingFrame<'_> {
                 set.add(item, vm)?;
                 Ok(None)
             }
-            bytecode::Instruction::SetExcInfo => {
-                // Set the current exception to TOS (for except* handlers)
-                // This updates sys.exc_info() so bare 'raise' will reraise the matched exception
-                let exc = self.top_value();
-                if let Some(exc) = exc.downcast_ref::<PyBaseException>() {
-                    vm.set_exception(Some(exc.to_owned()));
+            Instruction::SetUpdate { i } => {
+                let iterable = self.pop_value();
+                let obj = self.nth_value(i.get(arg));
+                let set: &Py<PySet> = unsafe {
+                    // SAFETY: compiler guarantees correct type
+                    obj.downcast_unchecked_ref()
+                };
+                let iter = PyIter::try_from_object(vm, iterable)?;
+                while let PyIterReturn::Return(item) = iter.next(vm)? {
+                    set.add(item, vm)?;
                 }
                 Ok(None)
             }
-            bytecode::Instruction::PushExcInfo => {
+            Instruction::PushExcInfo => {
                 // Stack: [exc] -> [prev_exc, exc]
                 let exc = self.pop_value();
                 let prev_exc = vm
@@ -1511,17 +1793,33 @@ impl ExecutingFrame<'_> {
                 self.push_value(exc);
                 Ok(None)
             }
-            bytecode::Instruction::CheckExcMatch => {
+            Instruction::CheckExcMatch => {
                 // Stack: [exc, type] -> [exc, bool]
                 let exc_type = self.pop_value();
                 let exc = self.top_value();
 
-                // Validate that exc_type is valid for exception matching
+                // Validate that exc_type inherits from BaseException
+                if let Some(tuple_of_exceptions) = exc_type.downcast_ref::<PyTuple>() {
+                    for exception in tuple_of_exceptions {
+                        if !exception
+                            .is_subclass(vm.ctx.exceptions.base_exception_type.into(), vm)?
+                        {
+                            return Err(vm.new_type_error(
+                                "catching classes that do not inherit from BaseException is not allowed",
+                            ));
+                        }
+                    }
+                } else if !exc_type.is_subclass(vm.ctx.exceptions.base_exception_type.into(), vm)? {
+                    return Err(vm.new_type_error(
+                        "catching classes that do not inherit from BaseException is not allowed",
+                    ));
+                }
+
                 let result = exc.is_instance(&exc_type, vm)?;
                 self.push_value(vm.ctx.new_bool(result).into());
                 Ok(None)
             }
-            bytecode::Instruction::Reraise { depth } => {
+            Instruction::Reraise { depth } => {
                 // inst(RERAISE, (values[oparg], exc -- values[oparg]))
                 //
                 // Stack layout: [values..., exc] where len(values) == oparg
@@ -1548,51 +1846,22 @@ impl ExecutingFrame<'_> {
                     Err(exc)
                 }
             }
-            bytecode::Instruction::SetFunctionAttribute { attr } => {
+            Instruction::SetFunctionAttribute { attr } => {
                 self.execute_set_function_attribute(vm, attr.get(arg))
             }
-            bytecode::Instruction::SetupAnnotations => self.setup_annotations(vm),
-            bytecode::Instruction::BeforeWith => {
-                // TOS: context_manager
-                // Result: [..., __exit__, __enter__ result]
-                let context_manager = self.pop_value();
-                let error_string = || -> String {
-                    format!(
-                        "'{:.200}' object does not support the context manager protocol",
-                        context_manager.class().name(),
-                    )
-                };
-
-                // Get __exit__ first (before calling __enter__)
-                let exit = context_manager
-                    .get_attr(identifier!(vm, __exit__), vm)
-                    .map_err(|_exc| {
-                        vm.new_type_error(format!("{} (missed __exit__ method)", error_string()))
-                    })?;
-
-                // Get and call __enter__
-                let enter_res = vm
-                    .get_special_method(&context_manager, identifier!(vm, __enter__))?
-                    .ok_or_else(|| vm.new_type_error(error_string()))?
-                    .invoke((), vm)?;
-
-                // Push __exit__ first, then enter result
-                self.push_value(exit);
-                self.push_value(enter_res);
-                Ok(None)
-            }
-            bytecode::Instruction::StoreAttr { idx } => self.store_attr(vm, idx.get(arg)),
-            bytecode::Instruction::StoreDeref(i) => {
+            Instruction::SetupAnnotations => self.setup_annotations(vm),
+            Instruction::StoreAttr { idx } => self.store_attr(vm, idx.get(arg)),
+            Instruction::StoreDeref(i) => {
                 let value = self.pop_value();
                 self.cells_frees[i.get(arg) as usize].set(Some(value));
                 Ok(None)
             }
-            bytecode::Instruction::StoreFast(idx) => {
+            Instruction::StoreFast(idx) => {
                 let value = self.pop_value();
                 self.fastlocals.lock()[idx.get(arg) as usize] = Some(value);
                 Ok(None)
             }
-            bytecode::Instruction::StoreFastLoadFast {
+            Instruction::StoreFastLoadFast {
                 store_idx,
                 load_idx,
             } => {
@@ -1607,21 +1876,51 @@ impl ExecutingFrame<'_> {
                 self.push_value(load_value);
                 Ok(None)
             }
-            bytecode::Instruction::StoreGlobal(idx) => {
+            Instruction::StoreFastStoreFast { arg: packed } => {
+                // Store two values to two local variables at once
+                // STORE_FAST idx1 executes first: pops TOS -> locals[idx1]
+                // STORE_FAST idx2 executes second: pops new TOS -> locals[idx2]
+                // oparg encoding: (idx1 << 4) | idx2
+                let oparg = packed.get(arg);
+                let idx1 = (oparg >> 4) as usize;
+                let idx2 = (oparg & 15) as usize;
+                let value1 = self.pop_value(); // TOS -> idx1
+                let value2 = self.pop_value(); // second -> idx2
+                let mut fastlocals = self.fastlocals.lock();
+                fastlocals[idx1] = Some(value1);
+                fastlocals[idx2] = Some(value2);
+                Ok(None)
+            }
+            Instruction::StoreGlobal(idx) => {
                 let value = self.pop_value();
                 self.globals
                     .set_item(self.code.names[idx.get(arg) as usize], value, vm)?;
                 Ok(None)
             }
-            bytecode::Instruction::StoreName(idx) => {
+            Instruction::StoreName(idx) => {
                 let name = self.code.names[idx.get(arg) as usize];
                 let value = self.pop_value();
                 self.locals.mapping().ass_subscript(name, Some(value), vm)?;
                 Ok(None)
             }
-            bytecode::Instruction::StoreSubscr => self.execute_store_subscript(vm),
-            bytecode::Instruction::Subscript => self.execute_subscript(vm),
-            bytecode::Instruction::Swap { index } => {
+            Instruction::StoreSlice => {
+                // Stack: [value, container, start, stop] -> []
+                let stop = self.pop_value();
+                let start = self.pop_value();
+                let container = self.pop_value();
+                let value = self.pop_value();
+                let slice: PyObjectRef = PySlice {
+                    start: Some(start),
+                    stop,
+                    step: None,
+                }
+                .into_ref(&vm.ctx)
+                .into();
+                container.set_item(&*slice, value, vm)?;
+                Ok(None)
+            }
+            Instruction::StoreSubscr => self.execute_store_subscript(vm),
+            Instruction::Swap { index } => {
                 let len = self.state.stack.len();
                 debug_assert!(len > 0, "stack underflow in SWAP");
                 let i = len - 1; // TOS index
@@ -1638,20 +1937,18 @@ impl ExecutingFrame<'_> {
                 self.state.stack.swap(i, j);
                 Ok(None)
             }
-            bytecode::Instruction::ToBool => {
+            Instruction::ToBool => {
                 let obj = self.pop_value();
                 let bool_val = obj.try_to_bool(vm)?;
                 self.push_value(vm.ctx.new_bool(bool_val).into());
                 Ok(None)
             }
-            bytecode::Instruction::UnpackEx { args } => {
+            Instruction::UnpackEx { args } => {
                 let args = args.get(arg);
                 self.execute_unpack_ex(vm, args.before, args.after)
             }
-            bytecode::Instruction::UnpackSequence { size } => {
-                self.unpack_sequence(size.get(arg), vm)
-            }
-            bytecode::Instruction::WithExceptStart => {
+            Instruction::UnpackSequence { size } => self.unpack_sequence(size.get(arg), vm),
+            Instruction::WithExceptStart => {
                 // Stack: [..., __exit__, lasti, prev_exc, exc]
                 // Call __exit__(type, value, tb) and push result
                 // __exit__ is at TOS-3 (below lasti, prev_exc, and exc)
@@ -1674,7 +1971,7 @@ impl ExecutingFrame<'_> {
 
                 Ok(None)
             }
-            bytecode::Instruction::YieldValue { arg: oparg } => {
+            Instruction::YieldValue { arg: oparg } => {
                 let value = self.pop_value();
                 // arg=0: direct yield (wrapped for async generators)
                 // arg=1: yield from await/yield-from (NOT wrapped)
@@ -1686,7 +1983,7 @@ impl ExecutingFrame<'_> {
                 };
                 Ok(Some(ExecutionResult::Yield(value)))
             }
-            bytecode::Instruction::Send { target } => {
+            Instruction::Send { target } => {
                 // Stack: (receiver, value) -> (receiver, retval)
                 // On StopIteration: replace value with stop value and jump to target
                 let exit_label = target.get(arg);
@@ -1710,7 +2007,7 @@ impl ExecutingFrame<'_> {
                     }
                 }
             }
-            bytecode::Instruction::EndSend => {
+            Instruction::EndSend => {
                 // Stack: (receiver, value) -> (value)
                 // Pops receiver, leaves value
                 let value = self.pop_value();
@@ -1718,7 +2015,18 @@ impl ExecutingFrame<'_> {
                 self.push_value(value);
                 Ok(None)
             }
-            bytecode::Instruction::CleanupThrow => {
+            Instruction::ExitInitCheck => {
+                // Check that __init__ returned None
+                let should_be_none = self.pop_value();
+                if !vm.is_none(&should_be_none) {
+                    return Err(vm.new_type_error(format!(
+                        "__init__() should return None, not '{}'",
+                        should_be_none.class().name()
+                    )));
+                }
+                Ok(None)
+            }
+            Instruction::CleanupThrow => {
                 // CLEANUP_THROW: (sub_iter, last_sent_val, exc) -> (None, value) OR re-raise
                 // If StopIteration: pop all 3, extract value, push (None, value)
                 // Otherwise: pop all 3, return Err(exc) for unwind_blocks to handle
@@ -1756,19 +2064,19 @@ impl ExecutingFrame<'_> {
                     .map_err(|_| vm.new_type_error("exception expected".to_owned()))?;
                 Err(exc)
             }
-            bytecode::Instruction::UnaryInvert => {
+            Instruction::UnaryInvert => {
                 let a = self.pop_value();
                 let value = vm._invert(&a)?;
                 self.push_value(value);
                 Ok(None)
             }
-            bytecode::Instruction::UnaryNegative => {
+            Instruction::UnaryNegative => {
                 let a = self.pop_value();
                 let value = vm._neg(&a)?;
                 self.push_value(value);
                 Ok(None)
             }
-            bytecode::Instruction::UnaryNot => {
+            Instruction::UnaryNot => {
                 let obj = self.pop_value();
                 let value = obj.try_to_bool(vm)?;
                 self.push_value(vm.ctx.new_bool(!value).into());
@@ -1787,16 +2095,6 @@ impl ExecutingFrame<'_> {
             .ok_or_else(|| {
                 vm.new_name_error(format!("name '{name}' is not defined"), name.to_owned())
             })
-    }
-
-    unsafe fn flatten_tuples(&mut self, size: usize) -> Vec<PyObjectRef> {
-        let mut elements = Vec::new();
-        for tup in self.pop_multiple(size) {
-            // SAFETY: caller ensures that the elements are tuples
-            let tup = unsafe { tup.downcast_unchecked::<PyTuple>() };
-            elements.extend(tup.iter().cloned());
-        }
-        elements
     }
 
     #[cfg_attr(feature = "flame-it", flame("Frame"))]
@@ -1964,20 +2262,7 @@ impl ExecutingFrame<'_> {
                 drop(fastlocals);
                 Ok(Some(ExecutionResult::Return(value)))
             }
-            UnwindReason::Break { target } | UnwindReason::Continue { target } => {
-                // Break/continue: jump to the target label
-                self.jump(target);
-                Ok(None)
-            }
         }
-    }
-
-    fn execute_subscript(&mut self, vm: &VirtualMachine) -> FrameResult {
-        let b_ref = self.pop_value();
-        let a_ref = self.pop_value();
-        let value = a_ref.get_item(&*b_ref, vm)?;
-        self.push_value(value);
-        Ok(None)
     }
 
     fn execute_store_subscript(&mut self, vm: &VirtualMachine) -> FrameResult {
@@ -2000,35 +2285,6 @@ impl ExecutingFrame<'_> {
         let map_obj = vm.ctx.new_dict();
         for (key, value) in self.pop_multiple(2 * size).tuples() {
             map_obj.set_item(&*key, value, vm)?;
-        }
-
-        self.push_value(map_obj.into());
-        Ok(None)
-    }
-
-    fn execute_build_map_for_call(&mut self, vm: &VirtualMachine, size: u32) -> FrameResult {
-        let size = size as usize;
-        let map_obj = vm.ctx.new_dict();
-        for obj in self.pop_multiple(size) {
-            // Use keys() method for all mapping objects to preserve order
-            Self::iterate_mapping_keys(vm, &obj, "keyword argument", |key| {
-                // Check for keyword argument restrictions
-                if key.downcast_ref::<PyStr>().is_none() {
-                    return Err(vm.new_type_error("keywords must be strings"));
-                }
-                if map_obj.contains_key(&*key, vm) {
-                    let key_repr = &key.repr(vm)?;
-                    let msg = format!(
-                        "got multiple values for keyword argument {}",
-                        key_repr.as_str()
-                    );
-                    return Err(vm.new_type_error(msg));
-                }
-
-                let value = obj.get_item(&*key, vm)?;
-                map_obj.set_item(&*key, value, vm)?;
-                Ok(())
-            })?;
         }
 
         self.push_value(map_obj.into());
@@ -2078,9 +2334,9 @@ impl ExecutingFrame<'_> {
         FuncArgs::with_kwargs_names(args, kwarg_names)
     }
 
-    fn collect_ex_args(&mut self, vm: &VirtualMachine, has_kwargs: bool) -> PyResult<FuncArgs> {
-        let kwargs = if has_kwargs {
-            let kw_obj = self.pop_value();
+    fn collect_ex_args(&mut self, vm: &VirtualMachine) -> PyResult<FuncArgs> {
+        let kwargs_or_null = self.pop_value_opt();
+        let kwargs = if let Some(kw_obj) = kwargs_or_null {
             let mut kwargs = IndexMap::new();
 
             // Use keys() method for all mapping objects to preserve order
@@ -2278,23 +2534,6 @@ impl ExecutingFrame<'_> {
         Ok(None)
     }
 
-    #[inline]
-    fn jump_if_or_pop(
-        &mut self,
-        vm: &VirtualMachine,
-        target: bytecode::Label,
-        flag: bool,
-    ) -> FrameResult {
-        let obj = self.top_value();
-        let value = obj.to_owned().try_to_bool(vm)?;
-        if value == flag {
-            self.jump(target);
-        } else {
-            self.pop_value();
-        }
-        Ok(None)
-    }
-
     /// The top of stack contains the iterator, lets push it forward
     fn execute_for_iter(&mut self, vm: &VirtualMachine, target: bytecode::Label) -> FrameResult {
         let top_of_stack = PyIter::new(self.top_value());
@@ -2307,15 +2546,30 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             Ok(PyIterReturn::StopIteration(_)) => {
-                // Pop iterator from stack:
-                self.pop_value();
-
-                // End of for loop
-                self.jump(target);
+                // Check if target instruction is END_FOR (CPython 3.14 pattern)
+                // If so, skip it and jump to target + 1 instruction (POP_ITER)
+                let target_idx = target.0 as usize;
+                let jump_target = if let Some(unit) = self.code.instructions.get(target_idx) {
+                    if matches!(unit.op, bytecode::Instruction::EndFor)
+                        && matches!(
+                            self.code.instructions.get(target_idx + 1).map(|u| &u.op),
+                            Some(bytecode::Instruction::PopIter)
+                        )
+                    {
+                        // Skip END_FOR, jump to POP_ITER
+                        bytecode::Label(target.0 + 1)
+                    } else {
+                        // Legacy pattern: jump directly to target (POP_TOP/POP_ITER)
+                        target
+                    }
+                } else {
+                    target
+                };
+                self.jump(jump_target);
                 Ok(None)
             }
             Err(next_error) => {
-                // Pop iterator from stack:
+                // On error, pop iterator and propagate
                 self.pop_value();
                 Err(next_error)
             }
@@ -2397,6 +2651,7 @@ impl ExecutingFrame<'_> {
             bytecode::BinaryOperator::InplaceXor => vm._ixor(a_ref, b_ref),
             bytecode::BinaryOperator::InplaceOr => vm._ior(a_ref, b_ref),
             bytecode::BinaryOperator::InplaceAnd => vm._iand(a_ref, b_ref),
+            bytecode::BinaryOperator::Subscr => a_ref.get_item(b_ref.as_object(), vm),
         }?;
 
         self.push_value(value);
@@ -2706,6 +2961,30 @@ impl ExecutingFrame<'_> {
                     .downcast::<PyList>()
                     .map_err(|_| vm.new_type_error("LIST_TO_TUPLE expects a list"))?;
                 Ok(vm.ctx.new_tuple(list.borrow_vec().to_vec()).into())
+            }
+            bytecode::IntrinsicFunction1::StopIterationError => {
+                // Convert StopIteration to RuntimeError
+                // Used to ensure async generators don't raise StopIteration directly
+                // _PyGen_FetchStopIterationValue
+                // Use fast_isinstance to handle subclasses of StopIteration
+                if arg.fast_isinstance(vm.ctx.exceptions.stop_iteration) {
+                    Err(vm.new_runtime_error("coroutine raised StopIteration"))
+                } else {
+                    // If not StopIteration, just re-raise the original exception
+                    Err(arg.downcast().unwrap_or_else(|obj| {
+                        vm.new_runtime_error(format!(
+                            "unexpected exception type: {:?}",
+                            obj.class()
+                        ))
+                    }))
+                }
+            }
+            bytecode::IntrinsicFunction1::AsyncGenWrap => {
+                // Wrap value for async generator
+                // Creates an AsyncGenWrappedValue
+                Ok(crate::builtins::asyncgenerator::PyAsyncGenWrappedValue(arg)
+                    .into_ref(&vm.ctx)
+                    .into())
             }
         }
     }

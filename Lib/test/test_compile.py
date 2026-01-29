@@ -108,7 +108,6 @@ class TestSpecifics(unittest.TestCase):
         exec('z = a', g, d)
         self.assertEqual(d['z'], 12)
 
-    @unittest.skip("TODO: RUSTPYTHON; segmentation fault")
     def test_extended_arg(self):
         # default: 1000 * 2.5 = 2500 repetitions
         repeat = int(sys.getrecursionlimit() * 2.5)
@@ -153,8 +152,6 @@ if 1:
         pass"""
         compile(s, "<string>", "exec")
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     # This test is probably specific to CPython and may not generalize
     # to other implementations.  We are trying to ensure that when
     # the first line of code starts after 256, correct line numbers
@@ -929,8 +926,6 @@ if 1:
                 func(save_caller_frame)
                 self.assertEqual(frame.f_lineno-frame.f_code.co_firstlineno, lastline)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_lineno_after_no_code(self):
         def no_code1():
             "doc string"
@@ -1423,8 +1418,6 @@ class TestExpressionStackSize(unittest.TestCase):
     def test_func_args(self):
         self.check_stack_size("f(" + "x, " * self.N + ")")
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_func_kwargs(self):
         kwargs = (f'a{i}=x' for i in range(self.N))
         self.check_stack_size("f(" +  ", ".join(kwargs) + ")")
@@ -1434,8 +1427,6 @@ class TestExpressionStackSize(unittest.TestCase):
     def test_meth_args(self):
         self.check_stack_size("o.m(" + "x, " * self.N + ")")
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_meth_kwargs(self):
         kwargs = (f'a{i}=x' for i in range(self.N))
         self.check_stack_size("o.m(" +  ", ".join(kwargs) + ")")

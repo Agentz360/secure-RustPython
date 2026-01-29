@@ -3,6 +3,7 @@ import contextvars
 import functools
 import gc
 import random
+import sys
 import time
 import unittest
 import weakref
@@ -216,8 +217,6 @@ class ContextTest(unittest.TestCase):
 
         ctx.run(fun)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     @isolated_context
     def test_context_getset_1(self):
         c = contextvars.ContextVar('c')
@@ -316,8 +315,6 @@ class ContextTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'different Context'):
             c.reset(tok)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     @isolated_context
     def test_context_getset_5(self):
         c = contextvars.ContextVar('c', default=42)
@@ -331,8 +328,6 @@ class ContextTest(unittest.TestCase):
         contextvars.copy_context().run(fun)
         self.assertEqual(c.get(), [])
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_context_copy_1(self):
         ctx1 = contextvars.Context()
         c = contextvars.ContextVar('c', default=42)
@@ -358,9 +353,9 @@ class ContextTest(unittest.TestCase):
 
         ctx1.run(ctx1_fun)
 
-    @unittest.skip("TODO: RUSTPYTHON; threading is not safe")
     @isolated_context
     @threading_helper.requires_working_threading()
+    @unittest.skipIf(sys.platform == 'darwin', 'TODO: RUSTPYTHON; Flaky on Mac, self.assertEqual(cvar.get(), num + i) AssertionError: 8 != 12')
     def test_context_threads_1(self):
         cvar = contextvars.ContextVar('cvar')
 

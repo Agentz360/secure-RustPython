@@ -1834,8 +1834,8 @@ class ClassPropertiesAndMethods(unittest.TestCase, ExtraAssertions):
         object.__init__(A(3))
         self.assertRaises(TypeError, object.__init__, A(3), 5)
 
-    @unittest.skip('TODO: RUSTPYTHON; This passes, but the `expectedFailure` here is from CPython, so this test is an "UNEXPECTED SUCCESS" (not good)')
-    @unittest.expectedFailure
+    # TODO: RUSTPYTHON; The `expectedFailure` here is from CPython, so this test must fail
+    # @unittest.expectedFailure
     def test_restored_object_new(self):
         class A(object):
             def __new__(cls, *args, **kwargs):
@@ -5258,7 +5258,6 @@ class PicklingTests(unittest.TestCase):
             self.assertEqual(obj.__reduce_ex__(proto), reduce_value)
             self.assertEqual(obj.__reduce__(), reduce_value)
 
-    @unittest.expectedFailure # TODO: RUSTPYTHON
     def test_reduce(self):
         protocols = range(pickle.HIGHEST_PROTOCOL + 1)
         args = (-101, "spam")
@@ -5382,7 +5381,6 @@ class PicklingTests(unittest.TestCase):
         for proto in protocols:
             self._check_reduce(proto, obj, listitems=list(obj))
 
-    @unittest.expectedFailure # TODO: RUSTPYTHON
     def test_special_method_lookup(self):
         protocols = range(pickle.HIGHEST_PROTOCOL + 1)
         class Picky:
@@ -5515,7 +5513,6 @@ class PicklingTests(unittest.TestCase):
                 y = pickle_copier.copy(x)
                 self._assert_is_copy(x, y)
 
-    @unittest.expectedFailure # TODO: RUSTPYTHON
     def test_reduce_copying(self):
         # Tests pickling and copying new-style classes and objects.
         global C1

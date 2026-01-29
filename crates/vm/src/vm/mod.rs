@@ -19,8 +19,12 @@ mod vm_ops;
 use crate::{
     AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
     builtins::{
-        PyBaseExceptionRef, PyDict, PyDictRef, PyInt, PyList, PyModule, PyStr, PyStrInterned,
-        PyStrRef, PyTypeRef, code::PyCode, pystr::AsPyStr, tuple::PyTuple,
+        self, PyBaseExceptionRef, PyDict, PyDictRef, PyInt, PyList, PyModule, PyStr, PyStrInterned,
+        PyStrRef, PyTypeRef,
+        code::PyCode,
+        dict::{PyDictItems, PyDictKeys, PyDictValues},
+        pystr::AsPyStr,
+        tuple::PyTuple,
     },
     codecs::CodecsRegistry,
     common::{hash::HashSecret, lock::PyMutex, rc::PyRc},
@@ -52,7 +56,7 @@ use std::{
 };
 
 pub use context::Context;
-pub use interpreter::Interpreter;
+pub use interpreter::{Interpreter, InterpreterBuilder};
 pub(crate) use method::PyMethod;
 pub use setting::{CheckHashPycsMode, Paths, PyConfig, Settings};
 
@@ -82,6 +86,8 @@ pub struct VirtualMachine {
     pub state: PyRc<PyGlobalState>,
     pub initialized: bool,
     recursion_depth: Cell<usize>,
+    /// C stack soft limit for detecting stack overflow (like c_stack_soft_limit)
+    c_stack_soft_limit: Cell<usize>,
     /// Async generator firstiter hook (per-thread, set via sys.set_asyncgen_hooks)
     pub async_gen_firstiter: RefCell<Option<PyObjectRef>>,
     /// Async generator finalizer hook (per-thread, set via sys.set_asyncgen_hooks)
@@ -96,7 +102,7 @@ struct ExceptionStack {
 
 pub struct PyGlobalState {
     pub config: PyConfig,
-    pub module_inits: stdlib::StdlibMap,
+    pub module_defs: std::collections::BTreeMap<&'static str, &'static builtins::PyModuleDef>,
     pub frozen: HashMap<&'static str, FrozenModule, ahash::RandomState>,
     pub stacksize: AtomicCell<usize>,
     pub thread_count: AtomicCell<usize>,
@@ -138,7 +144,7 @@ pub fn process_hash_secret_seed() -> u32 {
 
 impl VirtualMachine {
     /// Create a new `VirtualMachine` structure.
-    fn new(config: PyConfig, ctx: PyRc<Context>) -> Self {
+    pub(crate) fn new(ctx: PyRc<Context>, state: PyRc<PyGlobalState>) -> Self {
         flame_guard!("new VirtualMachine");
 
         // make a new module without access to the vm; doesn't
@@ -152,8 +158,8 @@ impl VirtualMachine {
         };
 
         // Hard-core modules:
-        let builtins = new_module(stdlib::builtins::__module_def(&ctx));
-        let sys_module = new_module(stdlib::sys::__module_def(&ctx));
+        let builtins = new_module(stdlib::builtins::module_def(&ctx));
+        let sys_module = new_module(stdlib::sys::module_def(&ctx));
 
         let import_func = ctx.none();
         let profile_func = RefCell::new(ctx.none());
@@ -163,23 +169,7 @@ impl VirtualMachine {
             const { RefCell::new([const { None }; signal::NSIG]) },
         ));
 
-        let module_inits = stdlib::get_module_inits();
-
-        let seed = match config.settings.hash_seed {
-            Some(seed) => seed,
-            None => process_hash_secret_seed(),
-        };
-        let hash_secret = HashSecret::new(seed);
-
-        let codec_registry = CodecsRegistry::new(&ctx);
-
-        let warnings = WarningsState::init_state(&ctx);
-
-        let int_max_str_digits = AtomicCell::new(match config.settings.int_max_str_digits {
-            -1 => 4300,
-            other => other,
-        } as usize);
-        let mut vm = Self {
+        let vm = Self {
             builtins,
             sys_module,
             ctx,
@@ -194,36 +184,10 @@ impl VirtualMachine {
             signal_handlers,
             signal_rx: None,
             repr_guards: RefCell::default(),
-            state: PyRc::new(PyGlobalState {
-                config,
-                module_inits,
-                frozen: HashMap::default(),
-                stacksize: AtomicCell::new(0),
-                thread_count: AtomicCell::new(0),
-                hash_secret,
-                atexit_funcs: PyMutex::default(),
-                codec_registry,
-                finalizing: AtomicBool::new(false),
-                warnings,
-                override_frozen_modules: AtomicCell::new(0),
-                before_forkers: PyMutex::default(),
-                after_forkers_child: PyMutex::default(),
-                after_forkers_parent: PyMutex::default(),
-                int_max_str_digits,
-                switch_interval: AtomicCell::new(0.005),
-                global_trace_func: PyMutex::default(),
-                global_profile_func: PyMutex::default(),
-                #[cfg(feature = "threading")]
-                main_thread_ident: AtomicCell::new(0),
-                #[cfg(feature = "threading")]
-                thread_frames: parking_lot::Mutex::new(HashMap::new()),
-                #[cfg(feature = "threading")]
-                thread_handles: parking_lot::Mutex::new(Vec::new()),
-                #[cfg(feature = "threading")]
-                shutdown_handles: parking_lot::Mutex::new(Vec::new()),
-            }),
+            state,
             initialized: false,
             recursion_depth: Cell::new(0),
+            c_stack_soft_limit: Cell::new(Self::calculate_c_stack_soft_limit()),
             async_gen_firstiter: RefCell::new(None),
             async_gen_finalizer: RefCell::new(None),
         };
@@ -237,9 +201,6 @@ impl VirtualMachine {
         {
             panic!("Interpreters in same process must share the hash seed");
         }
-
-        let frozen = core_frozen_inits().collect();
-        PyRc::get_mut(&mut vm.state).unwrap().frozen = frozen;
 
         vm.builtins.init_dict(
             vm.ctx.intern_str("builtins"),
@@ -268,7 +229,7 @@ impl VirtualMachine {
             });
 
             let guide_message = if cfg!(feature = "freeze-stdlib") {
-                "`rustpython_pylib` maybe not set while using `freeze-stdlib` feature. Try using `rustpython::InterpreterConfig::init_stdlib` or manually call `vm.add_frozen(rustpython_pylib::FROZEN_STDLIB)` in `rustpython_vm::Interpreter::with_init`."
+                "`rustpython_pylib` may not be set while using `freeze-stdlib` feature. Try using `rustpython::InterpreterBuilder::init_stdlib` or manually call `builder.add_frozen_modules(rustpython_pylib::FROZEN_STDLIB)` in `rustpython_vm::Interpreter::builder()`."
             } else if !env_set {
                 "Neither RUSTPYTHONPATH nor PYTHONPATH is set. Try setting one of them to the stdlib directory."
             } else if path_contains_env {
@@ -463,34 +424,6 @@ impl VirtualMachine {
         self.initialized = true;
     }
 
-    fn state_mut(&mut self) -> &mut PyGlobalState {
-        PyRc::get_mut(&mut self.state)
-            .expect("there should not be multiple threads while a user has a mut ref to a vm")
-    }
-
-    /// Can only be used in the initialization closure passed to [`Interpreter::with_init`]
-    pub fn add_native_module<S>(&mut self, name: S, module: stdlib::StdlibInitFunc)
-    where
-        S: Into<Cow<'static, str>>,
-    {
-        self.state_mut().module_inits.insert(name.into(), module);
-    }
-
-    pub fn add_native_modules<I>(&mut self, iter: I)
-    where
-        I: IntoIterator<Item = (Cow<'static, str>, stdlib::StdlibInitFunc)>,
-    {
-        self.state_mut().module_inits.extend(iter);
-    }
-
-    /// Can only be used in the initialization closure passed to [`Interpreter::with_init`]
-    pub fn add_frozen<I>(&mut self, frozen: I)
-    where
-        I: IntoIterator<Item = (&'static str, FrozenModule)>,
-    {
-        self.state_mut().frozen.extend(frozen);
-    }
-
     /// Set the custom signal channel for the interpreter
     pub fn set_user_signal_channel(&mut self, signal_rx: signal::UserSignalReceiver) {
         self.signal_rx = Some(signal_rx);
@@ -519,7 +452,7 @@ impl VirtualMachine {
     /// ```no_run
     /// use rustpython_vm::Interpreter;
     /// Interpreter::without_stdlib(Default::default()).enter(|vm| {
-    ///     let bytes = std::fs::read("__pycache__/<input>.rustpython-313.pyc").unwrap();
+    ///     let bytes = std::fs::read("__pycache__/<input>.rustpython-314.pyc").unwrap();
     ///     let main_scope = vm.new_scope_with_main().unwrap();
     ///     vm.run_pyc_bytes(&bytes, main_scope);
     /// });
@@ -546,6 +479,18 @@ impl VirtualMachine {
 
     #[cold]
     pub fn run_unraisable(&self, e: PyBaseExceptionRef, msg: Option<String>, object: PyObjectRef) {
+        // During interpreter finalization, sys.unraisablehook may not be available,
+        // but we still need to report exceptions (especially from atexit callbacks).
+        // Write directly to stderr like PyErr_FormatUnraisable.
+        if self
+            .state
+            .finalizing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.write_unraisable_to_stderr(&e, msg.as_deref(), &object);
+            return;
+        }
+
         let sys_module = self.import("sys", 0).unwrap();
         let unraisablehook = sys_module.get_attr("unraisablehook", self).unwrap();
 
@@ -561,6 +506,57 @@ impl VirtualMachine {
         };
         if let Err(e) = unraisablehook.call((args,), self) {
             println!("{}", e.as_object().repr(self).unwrap());
+        }
+    }
+
+    /// Write unraisable exception to stderr during finalization.
+    /// Similar to _PyErr_WriteUnraisableDefaultHook in CPython.
+    fn write_unraisable_to_stderr(
+        &self,
+        e: &PyBaseExceptionRef,
+        msg: Option<&str>,
+        object: &PyObjectRef,
+    ) {
+        // Get stderr once and reuse it
+        let stderr = crate::stdlib::sys::get_stderr(self).ok();
+
+        let write_to_stderr = |s: &str, stderr: &Option<PyObjectRef>, vm: &VirtualMachine| {
+            if let Some(stderr) = stderr {
+                let _ = vm.call_method(stderr, "write", (s.to_owned(),));
+            } else {
+                eprint!("{}", s);
+            }
+        };
+
+        // Format: "Exception ignored {msg} {object_repr}\n"
+        if let Some(msg) = msg {
+            write_to_stderr(&format!("Exception ignored {}", msg), &stderr, self);
+        } else {
+            write_to_stderr("Exception ignored in: ", &stderr, self);
+        }
+
+        if let Ok(repr) = object.repr(self) {
+            write_to_stderr(&format!("{}\n", repr.as_str()), &stderr, self);
+        } else {
+            write_to_stderr("<object repr failed>\n", &stderr, self);
+        }
+
+        // Write exception type and message
+        let exc_type_name = e.class().name();
+        if let Ok(exc_str) = e.as_object().str(self) {
+            let exc_str = exc_str.as_str();
+            if exc_str.is_empty() {
+                write_to_stderr(&format!("{}\n", exc_type_name), &stderr, self);
+            } else {
+                write_to_stderr(&format!("{}: {}\n", exc_type_name, exc_str), &stderr, self);
+            }
+        } else {
+            write_to_stderr(&format!("{}\n", exc_type_name), &stderr, self);
+        }
+
+        // Flush stderr to ensure output is visible
+        if let Some(ref stderr) = stderr {
+            let _ = self.call_method(stderr, "flush", ());
         }
     }
 
@@ -622,11 +618,127 @@ impl VirtualMachine {
         self.recursion_depth.get()
     }
 
+    /// Stack margin bytes (like _PyOS_STACK_MARGIN_BYTES).
+    /// 2048 * sizeof(void*) = 16KB for 64-bit.
+    const STACK_MARGIN_BYTES: usize = 2048 * std::mem::size_of::<usize>();
+
+    /// Get the stack boundaries using platform-specific APIs.
+    /// Returns (base, top) where base is the lowest address and top is the highest.
+    #[cfg(all(not(miri), windows))]
+    fn get_stack_bounds() -> (usize, usize) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThreadStackLimits, SetThreadStackGuarantee,
+        };
+        let mut low: usize = 0;
+        let mut high: usize = 0;
+        unsafe {
+            GetCurrentThreadStackLimits(&mut low as *mut usize, &mut high as *mut usize);
+            // Add the guaranteed stack space (reserved for exception handling)
+            let mut guarantee: u32 = 0;
+            SetThreadStackGuarantee(&mut guarantee);
+            low += guarantee as usize;
+        }
+        (low, high)
+    }
+
+    /// Get stack boundaries on non-Windows platforms.
+    /// Falls back to estimating based on current stack pointer.
+    #[cfg(all(not(miri), not(windows)))]
+    fn get_stack_bounds() -> (usize, usize) {
+        // Use pthread_attr_getstack on platforms that support it
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use libc::{
+                pthread_attr_destroy, pthread_attr_getstack, pthread_attr_t, pthread_getattr_np,
+                pthread_self,
+            };
+            let mut attr: pthread_attr_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                if pthread_getattr_np(pthread_self(), &mut attr) == 0 {
+                    let mut stack_addr: *mut libc::c_void = std::ptr::null_mut();
+                    let mut stack_size: libc::size_t = 0;
+                    if pthread_attr_getstack(&attr, &mut stack_addr, &mut stack_size) == 0 {
+                        pthread_attr_destroy(&mut attr);
+                        let base = stack_addr as usize;
+                        let top = base + stack_size;
+                        return (base, top);
+                    }
+                    pthread_attr_destroy(&mut attr);
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use libc::{pthread_get_stackaddr_np, pthread_get_stacksize_np, pthread_self};
+            unsafe {
+                let thread = pthread_self();
+                let stack_top = pthread_get_stackaddr_np(thread) as usize;
+                let stack_size = pthread_get_stacksize_np(thread);
+                let stack_base = stack_top - stack_size;
+                return (stack_base, stack_top);
+            }
+        }
+
+        // Fallback: estimate based on current SP and a default stack size
+        #[allow(unreachable_code)]
+        {
+            let current_sp = psm::stack_pointer() as usize;
+            // Assume 8MB stack, estimate base
+            let estimated_size = 8 * 1024 * 1024;
+            let base = current_sp.saturating_sub(estimated_size);
+            let top = current_sp + 1024 * 1024; // Assume we're not at the very top
+            (base, top)
+        }
+    }
+
+    /// Calculate the C stack soft limit based on actual stack boundaries.
+    /// soft_limit = base + 2 * margin (for downward-growing stacks)
+    #[cfg(not(miri))]
+    fn calculate_c_stack_soft_limit() -> usize {
+        let (base, _top) = Self::get_stack_bounds();
+        // Soft limit is 2 margins above the base
+        base + Self::STACK_MARGIN_BYTES * 2
+    }
+
+    /// Miri doesn't support inline assembly, so disable C stack checking.
+    #[cfg(miri)]
+    fn calculate_c_stack_soft_limit() -> usize {
+        0
+    }
+
+    /// Check if we're near the C stack limit (like _Py_MakeRecCheck).
+    /// Returns true only when stack pointer is in the "danger zone" between
+    /// soft_limit and hard_limit (soft_limit - 2*margin).
+    #[cfg(not(miri))]
+    #[inline(always)]
+    fn check_c_stack_overflow(&self) -> bool {
+        let current_sp = psm::stack_pointer() as usize;
+        let soft_limit = self.c_stack_soft_limit.get();
+        // Stack grows downward: check if we're below soft limit but above hard limit
+        // This matches CPython's _Py_MakeRecCheck behavior
+        current_sp < soft_limit
+            && current_sp >= soft_limit.saturating_sub(Self::STACK_MARGIN_BYTES * 2)
+    }
+
+    /// Miri doesn't support inline assembly, so always return false.
+    #[cfg(miri)]
+    #[inline(always)]
+    fn check_c_stack_overflow(&self) -> bool {
+        false
+    }
+
     /// Used to run the body of a (possibly) recursive function. It will raise a
     /// RecursionError if recursive functions are nested far too many times,
     /// preventing a stack overflow.
     pub fn with_recursion<R, F: FnOnce() -> PyResult<R>>(&self, _where: &str, f: F) -> PyResult<R> {
         self.check_recursive_call(_where)?;
+
+        // Native stack guard: check C stack like _Py_MakeRecCheck
+        if self.check_c_stack_overflow() {
+            return Err(self.new_recursion_error(_where.to_string()));
+        }
+
         self.recursion_depth.set(self.recursion_depth.get() + 1);
         let result = f();
         self.recursion_depth.set(self.recursion_depth.get() - 1);
@@ -808,6 +920,29 @@ impl VirtualMachine {
         } else if cls.is(self.ctx.types.list_type) {
             list_borrow = value.downcast_ref::<PyList>().unwrap().borrow_vec();
             &list_borrow
+        } else if cls.is(self.ctx.types.dict_keys_type) {
+            // Atomic snapshot of dict keys - prevents race condition during iteration
+            let keys = value.downcast_ref::<PyDictKeys>().unwrap().dict.keys_vec();
+            return keys.into_iter().map(func).collect();
+        } else if cls.is(self.ctx.types.dict_values_type) {
+            // Atomic snapshot of dict values - prevents race condition during iteration
+            let values = value
+                .downcast_ref::<PyDictValues>()
+                .unwrap()
+                .dict
+                .values_vec();
+            return values.into_iter().map(func).collect();
+        } else if cls.is(self.ctx.types.dict_items_type) {
+            // Atomic snapshot of dict items - prevents race condition during iteration
+            let items = value
+                .downcast_ref::<PyDictItems>()
+                .unwrap()
+                .dict
+                .items_vec();
+            return items
+                .into_iter()
+                .map(|(k, v)| func(self.ctx.new_tuple(vec![k, v]).into()))
+                .collect();
         } else {
             return self.map_py_iter(value, func);
         };
@@ -1172,89 +1307,52 @@ pub fn resolve_frozen_alias(name: &str) -> &str {
     }
 }
 
-fn core_frozen_inits() -> impl Iterator<Item = (&'static str, FrozenModule)> {
-    let iter = core::iter::empty();
-    macro_rules! ext_modules {
-        ($iter:ident, $($t:tt)*) => {
-            let $iter = $iter.chain(py_freeze!($($t)*));
-        };
-    }
-
-    // keep as example but use file one now
-    // ext_modules!(
-    //     iter,
-    //     source = "initialized = True; print(\"Hello world!\")\n",
-    //     module_name = "__hello__",
-    // );
-
-    // Python modules that the vm calls into, but are not actually part of the stdlib. They could
-    // in theory be implemented in Rust, but are easiest to do in Python for one reason or another.
-    // Includes _importlib_bootstrap and _importlib_bootstrap_external
-    ext_modules!(
-        iter,
-        dir = "./Lib/python_builtins",
-        crate_name = "rustpython_compiler_core"
-    );
-
-    // core stdlib Python modules that the vm calls into, but are still used in Python
-    // application code, e.g. copyreg
-    // FIXME: Initializing core_modules here results duplicated frozen module generation for core_modules.
-    // We need a way to initialize this modules for both `Interpreter::without_stdlib()` and `InterpreterConfig::new().init_stdlib().interpreter()`
-    // #[cfg(not(feature = "freeze-stdlib"))]
-    ext_modules!(
-        iter,
-        dir = "./Lib/core_modules",
-        crate_name = "rustpython_compiler_core"
-    );
-
-    iter
-}
-
 #[test]
 fn test_nested_frozen() {
     use rustpython_vm as vm;
 
-    vm::Interpreter::with_init(Default::default(), |vm| {
-        // vm.add_native_modules(rustpython_stdlib::get_module_inits());
-        vm.add_frozen(rustpython_vm::py_freeze!(
+    vm::Interpreter::builder(Default::default())
+        .add_frozen_modules(rustpython_vm::py_freeze!(
             dir = "../../extra_tests/snippets"
-        ));
-    })
-    .enter(|vm| {
-        let scope = vm.new_scope_with_builtins();
+        ))
+        .build()
+        .enter(|vm| {
+            let scope = vm.new_scope_with_builtins();
 
-        let source = "from dir_module.dir_module_inner import value2";
-        let code_obj = vm
-            .compile(source, vm::compiler::Mode::Exec, "<embedded>".to_owned())
-            .map_err(|err| vm.new_syntax_error(&err, Some(source)))
-            .unwrap();
+            let source = "from dir_module.dir_module_inner import value2";
+            let code_obj = vm
+                .compile(source, vm::compiler::Mode::Exec, "<embedded>".to_owned())
+                .map_err(|err| vm.new_syntax_error(&err, Some(source)))
+                .unwrap();
 
-        if let Err(e) = vm.run_code_obj(code_obj, scope) {
-            vm.print_exception(e);
-            panic!();
-        }
-    })
+            if let Err(e) = vm.run_code_obj(code_obj, scope) {
+                vm.print_exception(e);
+                panic!();
+            }
+        })
 }
 
 #[test]
 fn frozen_origname_matches() {
     use rustpython_vm as vm;
 
-    vm::Interpreter::with_init(Default::default(), |_vm| {}).enter(|vm| {
-        let check = |name, expected| {
-            let module = import::import_frozen(vm, name).unwrap();
-            let origname: PyStrRef = module
-                .get_attr("__origname__", vm)
-                .unwrap()
-                .try_into_value(vm)
-                .unwrap();
-            assert_eq!(origname.as_str(), expected);
-        };
+    vm::Interpreter::builder(Default::default())
+        .build()
+        .enter(|vm| {
+            let check = |name, expected| {
+                let module = import::import_frozen(vm, name).unwrap();
+                let origname: PyStrRef = module
+                    .get_attr("__origname__", vm)
+                    .unwrap()
+                    .try_into_value(vm)
+                    .unwrap();
+                assert_eq!(origname.as_str(), expected);
+            };
 
-        check("_frozen_importlib", "importlib._bootstrap");
-        check(
-            "_frozen_importlib_external",
-            "importlib._bootstrap_external",
-        );
-    });
+            check("_frozen_importlib", "importlib._bootstrap");
+            check(
+                "_frozen_importlib_external",
+                "importlib._bootstrap_external",
+            );
+        });
 }

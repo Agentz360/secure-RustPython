@@ -207,8 +207,6 @@ class TestCopy(unittest.TestCase):
         self.assertIsNot(y, x)
         self.assertEqual(y.foo, x.foo)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_copy_inst_getnewargs_ex(self):
         class C(int):
             def __new__(cls, *, foo):
@@ -507,8 +505,6 @@ class TestCopy(unittest.TestCase):
         self.assertEqual(y.foo, x.foo)
         self.assertIsNot(y.foo, x.foo)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_deepcopy_inst_getnewargs_ex(self):
         class C(int):
             def __new__(cls, *, foo):
@@ -938,8 +934,6 @@ class TestReplace(unittest.TestCase):
         self.assertEqual(attrs(copy.replace(a, y=2)), (11, 2, 13))
         self.assertEqual(attrs(copy.replace(a, x=1, y=2)), (1, 2, 3))
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_namedtuple(self):
         from collections import namedtuple
         from typing import NamedTuple

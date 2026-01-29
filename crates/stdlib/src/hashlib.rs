@@ -1,6 +1,6 @@
 // spell-checker:ignore usedforsecurity HASHXOF
 
-pub(crate) use _hashlib::make_module;
+pub(crate) use _hashlib::module_def;
 
 #[pymodule]
 pub mod _hashlib {
@@ -11,7 +11,7 @@ pub mod _hashlib {
         class::StaticType,
         convert::ToPyObject,
         function::{ArgBytesLike, ArgStrOrBytesLike, FuncArgs, OptionalArg},
-        types::{Constructor, Initializer, Representable},
+        types::{Constructor, Representable},
     };
     use blake2::{Blake2b512, Blake2s256};
     use digest::{DynDigest, core_api::BlockSizeUser};

@@ -24,7 +24,9 @@ fn bench_rustpython_code(b: &mut Bencher, name: &str, source: &str) {
     settings.path_list.push("Lib/".to_string());
     settings.write_bytecode = false;
     settings.user_site_directory = false;
-    Interpreter::without_stdlib(settings).enter(|vm| {
+    let builder = Interpreter::builder(settings);
+    let defs = rustpython_stdlib::stdlib_module_defs(&builder.ctx);
+    builder.add_native_modules(&defs).build().enter(|vm| {
         // Note: bench_cpython is both compiling and executing the code.
         // As such we compile the code in the benchmark loop as well.
         b.iter(|| {

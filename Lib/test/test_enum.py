@@ -445,7 +445,7 @@ class _EnumTests:
         with self.assertRaises(AttributeError):
             del Season.SPRING.name
 
-    @unittest.skip('TODO: RUSTPYTHON')
+    @unittest.expectedFailure # TODO: RUSTPYTHON
     # RuntimeError: Error calling __set_name__ on '_proto_member' instance failed in 'BadSuper'
     def test_bad_new_super(self):
         with self.assertRaisesRegex(
@@ -1923,7 +1923,7 @@ class TestSpecial(unittest.TestCase):
             class Wrong(Enum, str):
                 NotHere = 'error before this point'
 
-    @unittest.skip('TODO: RUSTPYTHON')
+    @unittest.expectedFailure # TODO: RUSTPYTHON
     # RuntimeError: Error calling __set_name__ on '_proto_member' instance INVALID in 'RgbColor'
     def test_raise_custom_error_on_creation(self):
         class InvalidRgbColorError(ValueError):
@@ -2130,7 +2130,6 @@ class TestSpecial(unittest.TestCase):
         test_pickle_dump_load(self.assertIs, NEI.y)
         test_pickle_dump_load(self.assertIs, NEI)
 
-    @unittest.expectedFailure # TODO: RUSTPYTHON; fails on pickle
     def test_subclasses_with_getnewargs_ex(self):
         class NamedInt(int):
             __qualname__ = 'NamedInt'       # needed for pickle protocol 4
@@ -2613,7 +2612,7 @@ class TestSpecial(unittest.TestCase):
         self.assertEqual(Test.flash.flash, 'flashy dynamic')
         self.assertEqual(Test.flash.value, 1)
 
-    @unittest.skip('TODO: RUSTPYTHON')
+    @unittest.expectedFailure # TODO: RUSTPYTHON
     # RuntimeError: Error calling __set_name__ on '_proto_member' instance grene in 'Color'
     def test_no_duplicates(self):
         class UniqueEnum(Enum):
@@ -3000,7 +2999,7 @@ class TestSpecial(unittest.TestCase):
         local_ls = {}
         exec(code, global_ns, local_ls)
 
-    @unittest.skip('TODO: RUSTPYTHON')
+    @unittest.expectedFailure # TODO: RUSTPYTHON
     # RuntimeError: Error calling __set_name__ on '_proto_member' instance one in 'FirstFailedStrEnum'
     def test_strenum(self):
         class GoodStrEnum(StrEnum):
@@ -3126,7 +3125,7 @@ class TestSpecial(unittest.TestCase):
                 one = '1'
                 two = b'2', 'ascii', 9
 
-    @unittest.skip('TODO: RUSTPYTHON')
+    @unittest.expectedFailure # TODO: RUSTPYTHON
     # RuntimeError: Error calling __set_name__ on '_proto_member' instance key_type in 'Combined'
     def test_missing_value_error(self):
         with self.assertRaisesRegex(TypeError, "_value_ not set in __new__"):
@@ -3414,7 +3413,7 @@ class TestSpecial(unittest.TestCase):
         self.assertEqual(FlagFromChar.a, 158456325028528675187087900672)
         self.assertEqual(FlagFromChar.a|1, 158456325028528675187087900673)
 
-    @unittest.skip('TODO: RUSTPYTHON')
+    @unittest.expectedFailure # TODO: RUSTPYTHON
     # RuntimeError: Error calling __set_name__ on '_proto_member' instance A in 'MyEnum'
     def test_init_exception(self):
         class Base:
@@ -5187,6 +5186,7 @@ class TestStdLib(unittest.TestCase):
         if failed:
             self.fail("result does not equal expected, see print above")
 
+    @unittest.expectedFailure  # TODO: RUSTPYTHON; Enum.__signature__ is @classmethod instead of @property
     def test_inspect_signatures(self):
         from inspect import signature, Signature, Parameter
         self.assertEqual(

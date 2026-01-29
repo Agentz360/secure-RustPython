@@ -37,10 +37,10 @@ class Opcode(typing.NamedTuple):
         return self.id < other.id
 
 
-def extract_enum_body(contents: str) -> str:
-    res = re.search(r"pub enum Instruction \{(.+?)\n\}", contents, re.DOTALL)
+def extract_enum_body(contents: str, enum_name: str) -> str:
+    res = re.search(f"pub enum {enum_name} " + r"\{(.+?)\n\}", contents, re.DOTALL)
     if not res:
-        raise ValueError("Could not find Instruction enum")
+        raise ValueError(f"Could not find {enum_name} enum")
 
     return "\n".join(
         line.split("//")[0].strip()  # Remove any comment. i.e. "foo // some comment"
@@ -49,8 +49,11 @@ def extract_enum_body(contents: str) -> str:
     )
 
 
-contents = BYTECODE_FILE.read_text()
-enum_body = extract_enum_body(contents)
+contents = BYTECODE_FILE.read_text(encoding="utf-8")
+enum_body = "\n".join(
+    extract_enum_body(contents, enum_name)
+    for enum_name in ("Instruction", "PseudoInstruction")
+)
 opcodes = list(Opcode.from_str(enum_body))
 
 # Generate the output file
@@ -75,4 +78,4 @@ HAVE_ARGUMENT = 44
 MIN_INSTRUMENTED_OPCODE = 236
 """
 
-OPCODE_METADATA_FILE.write_text(output)
+OPCODE_METADATA_FILE.write_text(output, encoding="utf-8")

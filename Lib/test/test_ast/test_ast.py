@@ -2396,7 +2396,7 @@ class ASTValidatorTests(unittest.TestCase):
         ast.MatchMapping([], [], rest="_"),
     ]
 
-    @unittest.skip("TODO: RUSTPYTHON; thread 'main' panicked")
+    @unittest.expectedFailure # TODO: RUSTPYTHON
     def test_match_validation_pattern(self):
         name_x = ast.Name("x", ast.Load())
         for pattern in self._MATCH_PATTERNS:
@@ -3023,7 +3023,6 @@ class NodeTransformerTests(ASTTestMixin, BaseNodeVisitorCases, unittest.TestCase
 
         self.assertASTTransformation(YieldRemover, code, expected)
 
-    @unittest.expectedFailure # TODO: RUSTPYTHON; <class 'object'> is not <class 'NoneType'>
     def test_node_return_list(self):
         code = """
         class DSL(Base, kw1=True): ...
@@ -3064,7 +3063,6 @@ class NodeTransformerTests(ASTTestMixin, BaseNodeVisitorCases, unittest.TestCase
 
         self.assertASTTransformation(PrintToLog, code, expected)
 
-    @unittest.expectedFailure # TODO: RUSTPYTHON; <class 'object'> is not <class 'NoneType'>
     def test_node_replace(self):
         code = """
         def func(arg):

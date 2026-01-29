@@ -1,19 +1,8 @@
-use crate::vm::{PyRef, VirtualMachine, builtins::PyModule, class::StaticType};
+pub(crate) use _contextvars::module_def;
+
+use crate::vm::PyRef;
 use _contextvars::PyContext;
 use core::cell::RefCell;
-
-pub(crate) fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
-    let module = _contextvars::make_module(vm);
-    let token_type = module.get_attr("Token", vm).unwrap();
-    token_type
-        .set_attr(
-            "MISSING",
-            _contextvars::ContextTokenMissing::static_type().to_owned(),
-            vm,
-        )
-        .unwrap();
-    module
-}
 
 thread_local! {
     // TODO: Vec doesn't seem to match copy behavior
@@ -24,12 +13,12 @@ thread_local! {
 mod _contextvars {
     use crate::vm::{
         AsObject, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine, atomic_func,
-        builtins::{PyGenericAlias, PyStrRef, PyType, PyTypeRef},
+        builtins::{PyGenericAlias, PyList, PyStrRef, PyType, PyTypeRef},
         class::StaticType,
         common::hash::PyHash,
         function::{ArgCallable, FuncArgs, OptionalArg},
         protocol::{PyMappingMethods, PySequenceMethods},
-        types::{AsMapping, AsSequence, Constructor, Hashable, Representable},
+        types::{AsMapping, AsSequence, Constructor, Hashable, Iterable, Representable},
     };
     use core::{
         cell::{Cell, RefCell, UnsafeCell},
@@ -163,7 +152,7 @@ mod _contextvars {
         }
     }
 
-    #[pyclass(with(Constructor, AsMapping, AsSequence))]
+    #[pyclass(with(Constructor, AsMapping, AsSequence, Iterable))]
     impl PyContext {
         #[pymethod]
         fn run(
@@ -179,11 +168,15 @@ mod _contextvars {
         }
 
         #[pymethod]
-        fn copy(&self) -> Self {
+        fn copy(&self, vm: &VirtualMachine) -> Self {
+            // Deep copy the vars - clone the underlying Hamt data, not just the PyRef
+            let vars_copy = HamtObject {
+                hamt: RefCell::new(self.inner.vars.hamt.borrow().clone()),
+            };
             Self {
                 inner: ContextInner {
                     idx: Cell::new(usize::MAX),
-                    vars: self.inner.vars.clone(),
+                    vars: vars_copy.into_ref(&vm.ctx),
                     entered: Cell::new(false),
                 },
             }
@@ -203,11 +196,6 @@ mod _contextvars {
 
         fn __len__(&self) -> usize {
             self.borrow_vars().len()
-        }
-
-        #[pymethod]
-        fn __iter__(&self) -> PyResult {
-            unimplemented!("Context.__iter__ is currently under construction")
         }
 
         #[pymethod]
@@ -237,6 +225,15 @@ mod _contextvars {
         fn values(zelf: PyRef<Self>) -> Vec<PyObjectRef> {
             let vars = zelf.borrow_vars();
             vars.values().map(|value| value.to_owned()).collect()
+        }
+
+        // TODO: wrong return type
+        #[pymethod]
+        fn items(zelf: PyRef<Self>, vm: &VirtualMachine) -> Vec<PyObjectRef> {
+            let vars = zelf.borrow_vars();
+            vars.iter()
+                .map(|(k, v)| vm.ctx.new_tuple(vec![k.clone().into(), v.clone()]).into())
+                .collect()
         }
     }
 
@@ -278,6 +275,15 @@ mod _contextvars {
                 ..PySequenceMethods::NOT_IMPLEMENTED
             });
             &AS_SEQUENCE
+        }
+    }
+
+    impl Iterable for PyContext {
+        fn iter(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult {
+            let vars = zelf.borrow_vars();
+            let keys: Vec<PyObjectRef> = vars.keys().map(|k| k.clone().into()).collect();
+            let list = vm.ctx.new_list(keys);
+            <PyList as Iterable>::iter(list, vm)
         }
     }
 
@@ -574,6 +580,22 @@ mod _contextvars {
         ) -> PyGenericAlias {
             PyGenericAlias::from_args(cls, args, vm)
         }
+
+        #[pymethod]
+        fn __enter__(zelf: PyRef<Self>) -> PyRef<Self> {
+            zelf
+        }
+
+        #[pymethod]
+        fn __exit__(
+            zelf: &Py<Self>,
+            _ty: PyObjectRef,
+            _val: PyObjectRef,
+            _tb: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            ContextVar::reset(&zelf.var, zelf.to_owned(), vm)
+        }
     }
 
     impl Constructor for ContextToken {
@@ -612,6 +634,19 @@ mod _contextvars {
 
     #[pyfunction]
     fn copy_context(vm: &VirtualMachine) -> PyContext {
-        PyContext::current(vm).copy()
+        PyContext::current(vm).copy(vm)
+    }
+
+    // Set Token.MISSING attribute
+    pub(crate) fn module_exec(
+        vm: &VirtualMachine,
+        module: &Py<crate::vm::builtins::PyModule>,
+    ) -> PyResult<()> {
+        __module_exec(vm, module);
+
+        let token_type = module.get_attr("Token", vm)?;
+        token_type.set_attr("MISSING", ContextTokenMissing::static_type().to_owned(), vm)?;
+
+        Ok(())
     }
 }

@@ -93,7 +93,7 @@ pub(super) unsafe fn debug_obj<T: PyPayload + core::fmt::Debug>(
 }
 
 /// Call `try_trace` on payload
-pub(super) unsafe fn try_trace_obj<T: PyPayload>(x: &PyObject, tracer_fn: &mut TraverseFn<'_>) {
+pub(super) unsafe fn try_traverse_obj<T: PyPayload>(x: &PyObject, tracer_fn: &mut TraverseFn<'_>) {
     let x = unsafe { &*(x as *const PyObject as *const PyInner<T>) };
     let payload = &x.payload;
     payload.try_traverse(tracer_fn)
@@ -753,7 +753,7 @@ impl PyObject {
     /// Check if this object can be downcast to T.
     #[inline(always)]
     pub fn downcastable<T: PyPayload>(&self) -> bool {
-        T::downcastable_from(self)
+        self.typeid() == T::PAYLOAD_TYPE_ID && unsafe { T::validate_downcastable_from(self) }
     }
 
     /// Attempt to downcast this reference to a subclass.

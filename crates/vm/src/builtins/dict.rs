@@ -2,6 +2,7 @@ use super::{
     IterStatus, PositionIterInternal, PyBaseExceptionRef, PyGenericAlias, PyMappingProxy, PySet,
     PyStr, PyStrRef, PyTupleRef, PyType, PyTypeRef, set::PySetInner,
 };
+use crate::object::{Traverse, TraverseFn};
 use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyRefExact, PyResult,
     TryFromObject, atomic_func,
@@ -29,12 +30,27 @@ use std::sync::LazyLock;
 
 pub type DictContentType = dict_inner::Dict;
 
-#[pyclass(module = false, name = "dict", unhashable = true, traverse)]
+#[pyclass(module = false, name = "dict", unhashable = true, traverse = "manual")]
 #[derive(Default)]
 pub struct PyDict {
     entries: DictContentType,
 }
 pub type PyDictRef = PyRef<PyDict>;
+
+// SAFETY: Traverse properly visits all owned PyObjectRefs
+unsafe impl Traverse for PyDict {
+    fn traverse(&self, traverse_fn: &mut TraverseFn<'_>) {
+        self.entries.traverse(traverse_fn);
+    }
+
+    fn clear(&mut self, out: &mut Vec<PyObjectRef>) {
+        // Pop all entries and collect both keys and values
+        for (key, value) in self.entries.drain_entries() {
+            out.push(key);
+            out.push(value);
+        }
+    }
+}
 
 impl fmt::Debug for PyDict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -60,6 +76,24 @@ impl PyDict {
     /// PyDict instead of using this
     pub(crate) const fn _as_dict_inner(&self) -> &DictContentType {
         &self.entries
+    }
+
+    /// Returns all keys as a Vec, atomically under a single read lock.
+    /// Thread-safe: prevents "dictionary changed size during iteration" errors.
+    pub fn keys_vec(&self) -> Vec<PyObjectRef> {
+        self.entries.keys()
+    }
+
+    /// Returns all values as a Vec, atomically under a single read lock.
+    /// Thread-safe: prevents "dictionary changed size during iteration" errors.
+    pub fn values_vec(&self) -> Vec<PyObjectRef> {
+        self.entries.values()
+    }
+
+    /// Returns all items as a Vec, atomically under a single read lock.
+    /// Thread-safe: prevents "dictionary changed size during iteration" errors.
+    pub fn items_vec(&self) -> Vec<(PyObjectRef, PyObjectRef)> {
+        self.entries.items()
     }
 
     // Used in update and ior.

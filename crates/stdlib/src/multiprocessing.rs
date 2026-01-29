@@ -1,4 +1,4 @@
-pub(crate) use _multiprocessing::make_module;
+pub(crate) use _multiprocessing::module_def;
 
 #[cfg(windows)]
 #[pymodule]
@@ -545,6 +545,13 @@ mod _multiprocessing {
             self.count.store(0, Ordering::Release);
             // Also reset last_tid for safety
             self.last_tid.store(0, Ordering::Release);
+        }
+
+        /// SemLock objects cannot be pickled directly.
+        /// Use multiprocessing.synchronize.SemLock wrapper which handles pickling.
+        #[pymethod]
+        fn __reduce__(&self, vm: &VirtualMachine) -> PyResult {
+            Err(vm.new_type_error("cannot pickle 'SemLock' object".to_owned()))
         }
 
         /// Num of `acquire()`s minus num of `release()`s for this process.

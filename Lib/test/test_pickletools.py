@@ -69,11 +69,6 @@ class OptimizedPickleTests(AbstractPickleTests, unittest.TestCase):
 
     # TODO: RUSTPYTHON
     @unittest.expectedFailure
-    def test_builtin_functions(self): # TODO(RUSTPYTHON): Remove this test when it passes
-        return super().test_builtin_functions()
-
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_bytearray_memoization(self): # TODO(RUSTPYTHON): Remove this test when it passes
         return super().test_bytearray_memoization()
 
@@ -96,16 +91,6 @@ class OptimizedPickleTests(AbstractPickleTests, unittest.TestCase):
     @unittest.expectedFailure
     def test_oob_buffers_writable_to_readonly(self): # TODO(RUSTPYTHON): Remove this test when it passes
         return super().test_oob_buffers_writable_to_readonly()
-
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
-    def test_py_methods(self): # TODO(RUSTPYTHON): Remove this test when it passes
-        return super().test_py_methods()
-
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
-    def test_complex_newobj_ex(self): # TODO(RUSTPYTHON): Remove this test when it passes
-        return super().test_complex_newobj_ex()
 
     # TODO: RUSTPYTHON
     @unittest.expectedFailure

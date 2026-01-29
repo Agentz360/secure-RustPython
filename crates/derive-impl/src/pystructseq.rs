@@ -595,7 +595,7 @@ pub(crate) fn impl_pystruct_sequence(
             const PAYLOAD_TYPE_ID: ::core::any::TypeId = <::rustpython_vm::builtins::PyTuple as ::rustpython_vm::PyPayload>::PAYLOAD_TYPE_ID;
 
             #[inline]
-            fn validate_downcastable_from(obj: &::rustpython_vm::PyObject) -> bool {
+            unsafe fn validate_downcastable_from(obj: &::rustpython_vm::PyObject) -> bool {
                 obj.class().fast_issubclass(<Self as ::rustpython_vm::class::StaticType>::static_type())
             }
 
@@ -606,8 +606,15 @@ pub(crate) fn impl_pystruct_sequence(
 
         // MaybeTraverse - delegate to inner PyTuple
         impl ::rustpython_vm::object::MaybeTraverse for #pytype_ident {
+            const HAS_TRAVERSE: bool = true;
+            const HAS_CLEAR: bool = true;
+
             fn try_traverse(&self, traverse_fn: &mut ::rustpython_vm::object::TraverseFn<'_>) {
                 self.0.try_traverse(traverse_fn)
+            }
+
+            fn try_clear(&mut self, out: &mut ::std::vec::Vec<::rustpython_vm::PyObjectRef>) {
+                self.0.try_clear(out)
             }
         }
 

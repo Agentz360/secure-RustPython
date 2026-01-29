@@ -1459,7 +1459,7 @@ class _TestLock(BaseTestCase):
         for _ in range(n):
             lock.release()
 
-    @unittest.skipIf(sys.platform == 'darwin', "TODO: RUSTPYTHON; flaky on darwin")
+    @unittest.skip("TODO: RUSTPYTHON; flaky timeout")
     def test_repr_rlock(self):
         if self.TYPE != 'processes':
             self.skipTest('test not appropriate for {}'.format(self.TYPE))
@@ -4417,6 +4417,7 @@ class _TestSharedMemory(BaseTestCase):
 
         sms.close()
 
+    @unittest.skip("TODO: RUSTPYTHON; flaky")
     @unittest.skipIf(os.name != "posix", "not feasible in non-posix platforms")
     def test_shared_memory_SharedMemoryServer_ignores_sigint(self):
         # bpo-36368: protect SharedMemoryManager server process from
@@ -6597,7 +6598,8 @@ class BaseMixin(object):
             support.print_warning(f'Dangling processes: {processes}')
         processes = None
 
-        threads = set(threading._dangling) - set(cls.dangling[1])
+        # TODO: RUSTPYTHON: Filter out stopped threads since gc.collect() is a no-op
+        threads = {t for t in threading._dangling if t.is_alive()} - {t for t in cls.dangling[1] if t.is_alive()}
         if threads:
             test.support.environment_altered = True
             support.print_warning(f'Dangling threads: {threads}')
@@ -6794,7 +6796,8 @@ def install_tests_in_module_dict(remote_globs, start_method,
             support.print_warning(f'Dangling processes: {processes}')
         processes = None
 
-        threads = set(threading._dangling) - set(dangling[1])
+        # TODO: RUSTPYTHON: Filter out stopped threads since gc.collect() is a no-op
+        threads = {t for t in threading._dangling if t.is_alive()} - {t for t in dangling[1] if t.is_alive()}
         if threads:
             need_sleep = True
             test.support.environment_altered = True

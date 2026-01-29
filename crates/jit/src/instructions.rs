@@ -211,8 +211,6 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             // If that was an unconditional branch or return, mark future instructions unreachable
             match instruction {
                 Instruction::ReturnValue
-                | Instruction::ReturnConst { .. }
-                | Instruction::Jump { .. }
                 | Instruction::JumpBackward { .. }
                 | Instruction::JumpBackwardNoInterrupt { .. }
                 | Instruction::JumpForward { .. } => {
@@ -561,8 +559,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             }
             Instruction::ExtendedArg => Ok(()),
 
-            Instruction::Jump { target }
-            | Instruction::JumpBackward { target }
+            Instruction::JumpBackward { target }
             | Instruction::JumpBackwardNoInterrupt { target }
             | Instruction::JumpForward { target } => {
                 let target_block = self.get_or_create_block(target.get(arg));
@@ -575,7 +572,13 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 self.stack.push(val);
                 Ok(())
             }
-            Instruction::LoadFast(idx) => {
+            Instruction::LoadSmallInt { idx } => {
+                let small_int = idx.get(arg) as i64;
+                let val = self.builder.ins().iconst(types::I64, small_int);
+                self.stack.push(JitValue::Int(val));
+                Ok(())
+            }
+            Instruction::LoadFast(idx) | Instruction::LoadFastBorrow(idx) => {
                 let local = self.variables[idx.get(arg) as usize]
                     .as_ref()
                     .ok_or(JitCompileError::BadBytecode)?;
@@ -583,6 +586,22 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                     local.ty.clone(),
                     self.builder.use_var(local.var),
                 ));
+                Ok(())
+            }
+            Instruction::LoadFastLoadFast { arg: packed }
+            | Instruction::LoadFastBorrowLoadFastBorrow { arg: packed } => {
+                let oparg = packed.get(arg);
+                let idx1 = oparg >> 4;
+                let idx2 = oparg & 0xF;
+                for idx in [idx1, idx2] {
+                    let local = self.variables[idx as usize]
+                        .as_ref()
+                        .ok_or(JitCompileError::BadBytecode)?;
+                    self.stack.push(JitValue::from_type_and_value(
+                        local.ty.clone(),
+                        self.builder.use_var(local.var),
+                    ));
+                }
                 Ok(())
             }
             Instruction::LoadGlobal(idx) => {
@@ -596,10 +615,6 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 }
             }
             Instruction::Nop => Ok(()),
-            Instruction::PopBlock => {
-                // TODO: block support
-                Ok(())
-            }
             Instruction::PopJumpIfFalse { target } => {
                 let cond = self.stack.pop().ok_or(JitCompileError::BadBytecode)?;
                 let val = self.boolean_val(cond)?;
@@ -633,11 +648,6 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             Instruction::Resume { arg: _resume_arg } => {
                 // TODO: Implement the resume instruction
                 Ok(())
-            }
-            Instruction::ReturnConst { idx } => {
-                let val = self
-                    .prepare_const(bytecode.constants[idx.get(arg) as usize].borrow_constant())?;
-                self.return_value(val)
             }
             Instruction::ReturnValue => {
                 let val = self.stack.pop().ok_or(JitCompileError::BadBytecode)?;

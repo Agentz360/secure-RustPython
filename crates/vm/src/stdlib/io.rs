@@ -1,6 +1,8 @@
 /*
  * I/O core tools.
  */
+pub(crate) use _io::module_def;
+
 cfg_if::cfg_if! {
     if #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))] {
         use crate::common::crt_fd::Offset;
@@ -19,7 +21,7 @@ cfg_if::cfg_if! {
 }
 
 use crate::{
-    PyObjectRef, PyRef, PyResult, TryFromObject, VirtualMachine,
+    PyObjectRef, PyResult, TryFromObject, VirtualMachine,
     builtins::{PyBaseExceptionRef, PyModule},
     common::os::ErrorExt,
     convert::{IntoPyException, ToPyException},
@@ -89,23 +91,6 @@ impl IntoPyException for std::io::Error {
     }
 }
 
-pub(crate) fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
-    let ctx = &vm.ctx;
-
-    let module = _io::make_module(vm);
-
-    #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
-    fileio::extend_module(vm, &module).unwrap();
-
-    let unsupported_operation = _io::unsupported_operation().to_owned();
-    extend_module!(vm, &module, {
-        "UnsupportedOperation" => unsupported_operation,
-        "BlockingIOError" => ctx.exceptions.blocking_io_error.to_owned(),
-    });
-
-    module
-}
-
 // not used on all platforms
 #[derive(Copy, Clone)]
 #[repr(transparent)]
@@ -158,8 +143,8 @@ mod _io {
         AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
         TryFromBorrowedObject, TryFromObject,
         builtins::{
-            PyBaseExceptionRef, PyBool, PyByteArray, PyBytes, PyBytesRef, PyMemoryView, PyStr,
-            PyStrRef, PyTuple, PyTupleRef, PyType, PyTypeRef, PyUtf8StrRef,
+            PyBaseExceptionRef, PyBool, PyByteArray, PyBytes, PyBytesRef, PyDict, PyMemoryView,
+            PyStr, PyStrRef, PyTuple, PyTupleRef, PyType, PyTypeRef, PyUtf8StrRef,
         },
         class::StaticType,
         common::lock::{
@@ -4077,6 +4062,71 @@ mod _io {
         const fn line_buffering(&self) -> bool {
             false
         }
+
+        #[pymethod]
+        fn __getstate__(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyTupleRef> {
+            let buffer = zelf.buffer(vm)?;
+            let content = Wtf8Buf::from_bytes(buffer.getvalue())
+                .map_err(|_| vm.new_value_error("Error Retrieving Value"))?;
+            let pos = buffer.tell();
+            drop(buffer);
+
+            // Get __dict__ if it exists and is non-empty
+            let dict_obj: PyObjectRef = match zelf.as_object().dict() {
+                Some(d) if !d.is_empty() => d.into(),
+                _ => vm.ctx.none(),
+            };
+
+            // Return (content, newline, position, dict)
+            // TODO: store actual newline setting when it's implemented
+            Ok(vm.ctx.new_tuple(vec![
+                vm.ctx.new_str(content).into(),
+                vm.ctx.new_str("\n").into(),
+                vm.ctx.new_int(pos).into(),
+                dict_obj,
+            ]))
+        }
+
+        #[pymethod]
+        fn __setstate__(zelf: PyRef<Self>, state: PyTupleRef, vm: &VirtualMachine) -> PyResult<()> {
+            // Check closed state first (like CHECK_CLOSED)
+            if zelf.closed.load() {
+                return Err(vm.new_value_error("__setstate__ on closed file"));
+            }
+            if state.len() != 4 {
+                return Err(vm.new_type_error(format!(
+                    "__setstate__ argument should be 4-tuple, got {}",
+                    state.len()
+                )));
+            }
+
+            let content: PyStrRef = state[0].clone().try_into_value(vm)?;
+            // state[1] is newline - TODO: use when newline handling is implemented
+            let pos: u64 = state[2].clone().try_into_value(vm)?;
+            let dict = &state[3];
+
+            // Set content and position
+            let raw_bytes = content.as_bytes().to_vec();
+            let mut buffer = zelf.buffer.write();
+            *buffer = BufferedIO::new(Cursor::new(raw_bytes));
+            buffer
+                .seek(SeekFrom::Start(pos))
+                .map_err(|err| os_err(vm, err))?;
+            drop(buffer);
+
+            // Set __dict__ if provided
+            if !vm.is_none(dict) {
+                let dict_ref: PyRef<PyDict> = dict.clone().try_into_value(vm)?;
+                if let Some(obj_dict) = zelf.as_object().dict() {
+                    obj_dict.clear();
+                    for (key, value) in dict_ref.into_iter() {
+                        obj_dict.set_item(&*key, value, vm)?;
+                    }
+                }
+            }
+
+            Ok(())
+        }
     }
 
     #[pyattr]
@@ -4223,6 +4273,65 @@ mod _io {
         fn close(&self, vm: &VirtualMachine) -> PyResult<()> {
             drop(self.try_resizable(vm)?);
             self.closed.store(true);
+            Ok(())
+        }
+
+        #[pymethod]
+        fn __getstate__(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyTupleRef> {
+            let buffer = zelf.buffer(vm)?;
+            let content = buffer.getvalue();
+            let pos = buffer.tell();
+            drop(buffer);
+
+            // Get __dict__ if it exists and is non-empty
+            let dict_obj: PyObjectRef = match zelf.as_object().dict() {
+                Some(d) if !d.is_empty() => d.into(),
+                _ => vm.ctx.none(),
+            };
+
+            // Return (content, position, dict)
+            Ok(vm.ctx.new_tuple(vec![
+                vm.ctx.new_bytes(content).into(),
+                vm.ctx.new_int(pos).into(),
+                dict_obj,
+            ]))
+        }
+
+        #[pymethod]
+        fn __setstate__(zelf: PyRef<Self>, state: PyTupleRef, vm: &VirtualMachine) -> PyResult<()> {
+            if zelf.closed.load() {
+                return Err(vm.new_value_error("__setstate__ on closed file"));
+            }
+            if state.len() != 3 {
+                return Err(vm.new_type_error(format!(
+                    "__setstate__ argument should be 3-tuple, got {}",
+                    state.len()
+                )));
+            }
+
+            let content: PyBytesRef = state[0].clone().try_into_value(vm)?;
+            let pos: u64 = state[1].clone().try_into_value(vm)?;
+            let dict = &state[2];
+
+            // Check exports and set content (like CHECK_EXPORTS)
+            let mut buffer = zelf.try_resizable(vm)?;
+            *buffer = BufferedIO::new(Cursor::new(content.as_bytes().to_vec()));
+            buffer
+                .seek(SeekFrom::Start(pos))
+                .map_err(|err| os_err(vm, err))?;
+            drop(buffer);
+
+            // Set __dict__ if provided
+            if !vm.is_none(dict) {
+                let dict_ref: PyRef<PyDict> = dict.clone().try_into_value(vm)?;
+                if let Some(obj_dict) = zelf.as_object().dict() {
+                    obj_dict.clear();
+                    for (key, value) in dict_ref.into_iter() {
+                        obj_dict.set_item(&*key, value, vm)?;
+                    }
+                }
+            }
+
             Ok(())
         }
     }
@@ -4619,8 +4728,23 @@ mod _io {
             assert_eq!(buffered.getvalue(), data);
         }
     }
-}
 
+    pub(crate) fn module_exec(vm: &VirtualMachine, module: &Py<PyModule>) -> PyResult<()> {
+        // Call auto-generated initialization first
+        __module_exec(vm, module);
+
+        // Initialize FileIO types on non-WASM platforms
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        super::fileio::module_exec(vm, module)?;
+
+        let unsupported_operation = unsupported_operation().to_owned();
+        extend_module!(vm, module, {
+            "UnsupportedOperation" => unsupported_operation,
+            "BlockingIOError" => vm.ctx.exceptions.blocking_io_error.to_owned(),
+        });
+        Ok(())
+    }
+}
 // disable FileIO on WASM
 #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
 #[pymodule]
