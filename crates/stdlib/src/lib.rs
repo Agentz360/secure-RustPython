@@ -2,7 +2,6 @@
 // how `mod` works, but we want this sometimes for pymodule declarations
 
 #![allow(clippy::module_inception)]
-#![cfg_attr(all(target_os = "wasi", target_env = "p2"), feature(wasip2))]
 
 #[macro_use]
 extern crate rustpython_derive;
@@ -12,6 +11,7 @@ extern crate alloc;
 pub(crate) mod macros;
 
 mod _asyncio;
+mod _remote_debugging;
 pub mod array;
 mod binascii;
 mod bisect;
@@ -113,6 +113,7 @@ pub fn stdlib_module_defs(ctx: &Context) -> Vec<&'static builtins::PyModuleDef> 
     vec![
         _asyncio::module_def(ctx),
         _opcode::module_def(ctx),
+        _remote_debugging::module_def(ctx),
         array::module_def(ctx),
         binascii::module_def(ctx),
         bisect::module_def(ctx),
