@@ -2,6 +2,7 @@ use super::{
     PyGenericAlias, PyInt, PyIntRef, PySlice, PyTupleRef, PyType, PyTypeRef, builtins_iter,
     tuple::tuple_hash,
 };
+use crate::common::lock::LazyLock;
 use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
     VirtualMachine, atomic_func,
@@ -19,7 +20,6 @@ use crossbeam_utils::atomic::AtomicCell;
 use malachite_bigint::{BigInt, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
-use std::sync::LazyLock;
 
 // Search flag passed to iter_search
 enum SearchType {
@@ -670,7 +670,7 @@ fn range_iter_reduce(
     index: usize,
     vm: &VirtualMachine,
 ) -> PyResult<PyTupleRef> {
-    let iter = builtins_iter(vm).to_owned();
+    let iter = builtins_iter(vm);
     let stop = start.clone() + length * step.clone();
     let range = PyRange {
         start: PyInt::from(start).into_ref(&vm.ctx),

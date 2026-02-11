@@ -3,6 +3,7 @@ use crate::{
     PyResult, builtins, common::rc::PyRc, frozen::FrozenModule, getpath, py_freeze, stdlib::atexit,
     vm::PyBaseExceptionRef,
 };
+use alloc::collections::BTreeMap;
 use core::sync::atomic::Ordering;
 
 type InitFunc = Box<dyn FnOnce(&mut VirtualMachine)>;
@@ -45,8 +46,8 @@ where
     use crate::common::hash::HashSecret;
     use crate::common::lock::PyMutex;
     use crate::warn::WarningsState;
+    use core::sync::atomic::AtomicBool;
     use crossbeam_utils::atomic::AtomicCell;
-    use std::sync::atomic::AtomicBool;
 
     let paths = getpath::init_path_config(&settings);
     let config = PyConfig::new(settings, paths);
@@ -55,14 +56,12 @@ where
     crate::exceptions::ExceptionZoo::extend(&ctx);
 
     // Build module_defs map from builtin modules + additional modules
-    let mut all_module_defs: std::collections::BTreeMap<
-        &'static str,
-        &'static builtins::PyModuleDef,
-    > = crate::stdlib::builtin_module_defs(&ctx)
-        .into_iter()
-        .chain(module_defs)
-        .map(|def| (def.name.as_str(), def))
-        .collect();
+    let mut all_module_defs: BTreeMap<&'static str, &'static builtins::PyModuleDef> =
+        crate::stdlib::builtin_module_defs(&ctx)
+            .into_iter()
+            .chain(module_defs)
+            .map(|def| (def.name.as_str(), def))
+            .collect();
 
     // Register sysconfigdata under platform-specific name as well
     if let Some(&sysconfigdata_def) = all_module_defs.get("_sysconfigdata") {
@@ -444,13 +443,6 @@ fn core_frozen_inits() -> impl Iterator<Item = (&'static str, FrozenModule)> {
         };
     }
 
-    // keep as example but use file one now
-    // ext_modules!(
-    //     iter,
-    //     source = "initialized = True; print(\"Hello world!\")\n",
-    //     module_name = "__hello__",
-    // );
-
     // Python modules that the vm calls into, but are not actually part of the stdlib. They could
     // in theory be implemented in Rust, but are easiest to do in Python for one reason or another.
     // Includes _importlib_bootstrap and _importlib_bootstrap_external
@@ -471,7 +463,62 @@ fn core_frozen_inits() -> impl Iterator<Item = (&'static str, FrozenModule)> {
         crate_name = "rustpython_compiler_core"
     );
 
-    iter
+    // Collect and add frozen module aliases for test modules
+    let mut entries: Vec<_> = iter.collect();
+    if let Some(hello_code) = entries
+        .iter()
+        .find(|(n, _)| *n == "__hello__")
+        .map(|(_, m)| m.code)
+    {
+        entries.push((
+            "__hello_alias__",
+            FrozenModule {
+                code: hello_code,
+                package: false,
+            },
+        ));
+        entries.push((
+            "__phello_alias__",
+            FrozenModule {
+                code: hello_code,
+                package: true,
+            },
+        ));
+        entries.push((
+            "__phello_alias__.spam",
+            FrozenModule {
+                code: hello_code,
+                package: false,
+            },
+        ));
+    }
+    if let Some(code) = entries
+        .iter()
+        .find(|(n, _)| *n == "__phello__")
+        .map(|(_, m)| m.code)
+    {
+        entries.push((
+            "__phello__.__init__",
+            FrozenModule {
+                code,
+                package: false,
+            },
+        ));
+    }
+    if let Some(code) = entries
+        .iter()
+        .find(|(n, _)| *n == "__phello__.ham")
+        .map(|(_, m)| m.code)
+    {
+        entries.push((
+            "__phello__.ham.__init__",
+            FrozenModule {
+                code,
+                package: false,
+            },
+        ));
+    }
+    entries.into_iter()
 }
 
 #[cfg(test)]

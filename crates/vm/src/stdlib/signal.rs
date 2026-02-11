@@ -28,7 +28,7 @@ pub(crate) mod _signal {
             static WAKEUP: atomic::AtomicUsize = atomic::AtomicUsize::new(INVALID_WAKEUP);
             // windows doesn't use the same fds for files and sockets like windows does, so we need
             // this to know whether to send() or write()
-            static WAKEUP_IS_SOCKET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static WAKEUP_IS_SOCKET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
             impl<'a> TryFromBorrowedObject<'a> for WakeupFd {
                 fn try_from_borrowed_object(vm: &VirtualMachine, obj: &'a crate::PyObject) -> PyResult<Self> {
@@ -177,7 +177,9 @@ pub(crate) mod _signal {
                 } else {
                     None
                 };
-                vm.signal_handlers.as_deref().unwrap().borrow_mut()[signum] = py_handler;
+                vm.signal_handlers
+                    .get_or_init(signal::new_signal_handlers)
+                    .borrow_mut()[signum] = py_handler;
             }
 
             let int_handler = module
@@ -220,10 +222,9 @@ pub(crate) mod _signal {
                 return Err(vm.new_value_error(format!("signal number {} out of range", signalnum)));
             }
         }
-        let signal_handlers = vm
-            .signal_handlers
-            .as_deref()
-            .ok_or_else(|| vm.new_value_error("signal only works in main thread"))?;
+        if !vm.is_main_thread() {
+            return Err(vm.new_value_error("signal only works in main thread"));
+        }
 
         let sig_handler =
             match usize::try_from_borrowed_object(vm, &handler).ok() {
@@ -245,6 +246,7 @@ pub(crate) mod _signal {
             siginterrupt(signalnum, 1);
         }
 
+        let signal_handlers = vm.signal_handlers.get_or_init(signal::new_signal_handlers);
         let old_handler = signal_handlers.borrow_mut()[signalnum as usize].replace(handler);
         Ok(old_handler)
     }
@@ -252,10 +254,7 @@ pub(crate) mod _signal {
     #[pyfunction]
     fn getsignal(signalnum: i32, vm: &VirtualMachine) -> PyResult {
         signal::assert_in_range(signalnum, vm)?;
-        let signal_handlers = vm
-            .signal_handlers
-            .as_deref()
-            .ok_or_else(|| vm.new_value_error("getsignal only works in main thread"))?;
+        let signal_handlers = vm.signal_handlers.get_or_init(signal::new_signal_handlers);
         let handler = signal_handlers.borrow()[signalnum as usize]
             .clone()
             .unwrap_or_else(|| vm.ctx.none());
@@ -372,8 +371,8 @@ pub(crate) mod _signal {
         #[cfg(not(windows))]
         let fd = args.fd;
 
-        if vm.signal_handlers.is_none() {
-            return Err(vm.new_value_error("signal only works in main thread"));
+        if !vm.is_main_thread() {
+            return Err(vm.new_value_error("set_wakeup_fd only works in main thread"));
         }
 
         #[cfg(windows)]
@@ -382,7 +381,7 @@ pub(crate) mod _signal {
 
             crate::windows::init_winsock();
             let mut res = 0i32;
-            let mut res_size = std::mem::size_of::<i32>() as i32;
+            let mut res_size = core::mem::size_of::<i32>() as i32;
             let res = unsafe {
                 WinSock::getsockopt(
                     fd,
@@ -468,7 +467,7 @@ pub(crate) mod _signal {
                 libc::SYS_pidfd_send_signal,
                 pidfd,
                 sig,
-                std::ptr::null::<libc::siginfo_t>(),
+                core::ptr::null::<libc::siginfo_t>(),
                 flags,
             ) as libc::c_long
         };

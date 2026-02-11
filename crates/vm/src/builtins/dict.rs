@@ -2,6 +2,7 @@ use super::{
     IterStatus, PositionIterInternal, PyBaseExceptionRef, PyGenericAlias, PyMappingProxy, PySet,
     PyStr, PyStrRef, PyTupleRef, PyType, PyTypeRef, set::PySetInner,
 };
+use crate::common::lock::LazyLock;
 use crate::object::{Traverse, TraverseFn};
 use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyRefExact, PyResult,
@@ -26,7 +27,6 @@ use crate::{
 };
 use alloc::fmt;
 use rustpython_common::lock::PyMutex;
-use std::sync::LazyLock;
 
 pub type DictContentType = dict_inner::Dict;
 
@@ -898,7 +898,7 @@ macro_rules! dict_view {
             #[allow(clippy::redundant_closure_call)]
             #[pymethod]
             fn __reduce__(&self, vm: &VirtualMachine) -> PyTupleRef {
-                let iter = builtins_iter(vm).to_owned();
+                let iter = builtins_iter(vm);
                 let internal = self.internal.lock();
                 let entries = match &internal.status {
                     IterStatus::Active(dict) => dict
@@ -968,7 +968,7 @@ macro_rules! dict_view {
             #[allow(clippy::redundant_closure_call)]
             #[pymethod]
             fn __reduce__(&self, vm: &VirtualMachine) -> PyTupleRef {
-                let iter = builtins_reversed(vm).to_owned();
+                let iter = builtins_reversed(vm);
                 let internal = self.internal.lock();
                 // TODO: entries must be reversed too
                 let entries = match &internal.status {

@@ -1,4 +1,5 @@
 use super::{genericalias, type_};
+use crate::common::lock::LazyLock;
 use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
     atomic_func,
@@ -8,11 +9,10 @@ use crate::{
     convert::ToPyObject,
     function::PyComparisonValue,
     protocol::{PyMappingMethods, PyNumberMethods},
-    stdlib::typing::TypeAliasType,
+    stdlib::typing::{TypeAliasType, call_typing_func_object},
     types::{AsMapping, AsNumber, Comparable, GetAttr, Hashable, PyComparisonOp, Representable},
 };
 use alloc::fmt;
-use std::sync::LazyLock;
 
 const CLS_ATTRS: &[&str] = &["__module__"];
 
@@ -193,13 +193,43 @@ impl PyUnion {
     }
 }
 
-pub fn is_unionable(obj: PyObjectRef, vm: &VirtualMachine) -> bool {
+fn is_unionable(obj: PyObjectRef, vm: &VirtualMachine) -> bool {
     let cls = obj.class();
     cls.is(vm.ctx.types.none_type)
         || obj.downcastable::<PyType>()
         || cls.fast_issubclass(vm.ctx.types.generic_alias_type)
         || cls.is(vm.ctx.types.union_type)
         || obj.downcast_ref::<TypeAliasType>().is_some()
+}
+
+fn type_check(arg: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+    // Fast path to avoid calling into typing.py
+    if is_unionable(arg.clone(), vm) {
+        return Ok(arg);
+    }
+    let message_str: PyObjectRef = vm
+        .ctx
+        .new_str("Union[arg, ...]: each arg must be a type.")
+        .into();
+    call_typing_func_object(vm, "_type_check", (arg, message_str))
+}
+
+fn has_union_operands(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> bool {
+    let union_type = vm.ctx.types.union_type;
+    a.class().is(union_type) || b.class().is(union_type)
+}
+
+pub fn or_op(zelf: PyObjectRef, other: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+    if !has_union_operands(zelf.clone(), other.clone(), vm)
+        && (!is_unionable(zelf.clone(), vm) || !is_unionable(other.clone(), vm))
+    {
+        return Ok(vm.ctx.not_implemented());
+    }
+
+    let left = type_check(zelf, vm)?;
+    let right = type_check(other, vm)?;
+    let tuple = PyTuple::new_ref(vec![left, right], &vm.ctx);
+    make_union(&tuple, vm)
 }
 
 fn make_parameters(args: &Py<PyTuple>, vm: &VirtualMachine) -> PyResult<PyTupleRef> {

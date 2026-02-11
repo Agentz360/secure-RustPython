@@ -20,20 +20,6 @@ pub(crate) fn fs_metadata<P: AsRef<Path>>(
     }
 }
 
-#[cfg(unix)]
-impl crate::convert::IntoPyException for nix::Error {
-    fn into_pyexception(self, vm: &VirtualMachine) -> crate::builtins::PyBaseExceptionRef {
-        io::Error::from(self).into_pyexception(vm)
-    }
-}
-
-#[cfg(unix)]
-impl crate::convert::IntoPyException for rustix::io::Errno {
-    fn into_pyexception(self, vm: &VirtualMachine) -> crate::builtins::PyBaseExceptionRef {
-        io::Error::from(self).into_pyexception(vm)
-    }
-}
-
 #[allow(dead_code)]
 #[derive(FromArgs, Default)]
 pub struct TargetIsDirectory {
@@ -174,7 +160,6 @@ pub(super) mod _os {
         AsObject, Py, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
         builtins::{
             PyBytesRef, PyGenericAlias, PyIntRef, PyStrRef, PyTuple, PyTupleRef, PyTypeRef,
-            ToOSErrorBuilder,
         },
         common::{
             crt_fd,
@@ -183,7 +168,7 @@ pub(super) mod _os {
             suppress_iph,
         },
         convert::{IntoPyException, ToPyObject},
-        exceptions::OSErrorBuilder,
+        exceptions::{OSErrorBuilder, ToOSErrorBuilder},
         function::{ArgBytesLike, ArgMemoryBuffer, FsPath, FuncArgs, OptionalArg},
         ospath::{OsPath, OsPathOrFd, OutputMode, PathConverter},
         protocol::PyIterReturn,
@@ -289,7 +274,7 @@ pub(super) mod _os {
                 crt_fd::open(&name, flags, mode)
             }
         };
-        fd.map_err(|err| OSErrorBuilder::with_filename(&err, name, vm))
+        fd.map_err(|err| OSErrorBuilder::with_filename_from_errno(&err, name, vm))
     }
 
     #[pyfunction]
@@ -672,16 +657,28 @@ pub(super) mod _os {
                     vm,
                 )
             };
-            let lstat = || self.lstat.get_or_try_init(|| do_stat(false));
+            let lstat = || match self.lstat.get() {
+                Some(val) => Ok(val),
+                None => {
+                    let val = do_stat(false)?;
+                    let _ = self.lstat.set(val);
+                    Ok(self.lstat.get().unwrap())
+                }
+            };
             let stat = if follow_symlinks.0 {
                 // if follow_symlinks == true and we aren't a symlink, cache both stat and lstat
-                self.stat.get_or_try_init(|| {
-                    if self.is_symlink(vm)? {
-                        do_stat(true)
-                    } else {
-                        lstat().cloned()
+                match self.stat.get() {
+                    Some(val) => val,
+                    None => {
+                        let val = if self.is_symlink(vm)? {
+                            do_stat(true)?
+                        } else {
+                            lstat()?.clone()
+                        };
+                        let _ = self.stat.set(val);
+                        self.stat.get().unwrap()
                     }
-                })?
+                }
             } else {
                 lstat()?
             };
@@ -1011,10 +1008,10 @@ pub(super) mod _os {
             let st_ino = stat.st_ino;
 
             #[cfg(not(windows))]
-            #[allow(clippy::useless_conversion)] // needed for 32-bit platforms
+            #[allow(clippy::useless_conversion, reason = "needed for 32-bit platforms")]
             let st_blksize = i64::from(stat.st_blksize);
             #[cfg(not(windows))]
-            #[allow(clippy::useless_conversion)] // needed for 32-bit platforms
+            #[allow(clippy::useless_conversion, reason = "needed for 32-bit platforms")]
             let st_blocks = i64::from(stat.st_blocks);
 
             Self {
@@ -1342,9 +1339,9 @@ pub(super) mod _os {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            let src_cstr = std::ffi::CString::new(src.path.as_os_str().as_bytes())
+            let src_cstr = alloc::ffi::CString::new(src.path.as_os_str().as_bytes())
                 .map_err(|_| vm.new_value_error("embedded null byte"))?;
-            let dst_cstr = std::ffi::CString::new(dst.path.as_os_str().as_bytes())
+            let dst_cstr = alloc::ffi::CString::new(dst.path.as_os_str().as_bytes())
                 .map_err(|_| vm.new_value_error("embedded null byte"))?;
 
             let follow = follow_symlinks.into_option().unwrap_or(true);
@@ -1595,7 +1592,7 @@ pub(super) mod _os {
     fn times(vm: &VirtualMachine) -> PyResult {
         #[cfg(windows)]
         {
-            use std::mem::MaybeUninit;
+            use core::mem::MaybeUninit;
             use windows_sys::Win32::{Foundation::FILETIME, System::Threading};
 
             let mut _create = MaybeUninit::<FILETIME>::uninit();
@@ -1813,7 +1810,7 @@ pub(super) mod _os {
             } else {
                 let encoding = unsafe {
                     let encoding = libc::nl_langinfo(libc::CODESET);
-                    if encoding.is_null() || encoding.read() == '\0' as libc::c_char {
+                    if encoding.is_null() || encoding.read() == b'\0' as libc::c_char {
                         "UTF-8".to_owned()
                     } else {
                         core::ffi::CStr::from_ptr(encoding).to_string_lossy().into_owned()

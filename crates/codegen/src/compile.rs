@@ -22,16 +22,14 @@ use malachite_bigint::BigInt;
 use num_complex::Complex;
 use num_traits::{Num, ToPrimitive};
 use ruff_python_ast as ast;
-use ruff_text_size::{Ranged, TextRange};
-use std::collections::HashSet;
-
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use rustpython_compiler_core::{
     Mode, OneIndexed, PositionEncoding, SourceFile, SourceLocation,
     bytecode::{
         self, AnyInstruction, Arg as OpArgMarker, BinaryOperator, BuildSliceArgCount, CodeObject,
         ComparisonOperator, ConstantData, ConvertValueOparg, Instruction, IntrinsicFunction1,
-        Invert, OpArg, OpArgType, PseudoInstruction, SpecialMethod, UnpackExArgs,
-        encode_load_attr_arg, encode_load_super_attr_arg,
+        Invert, LoadAttr, LoadSuperAttr, OpArg, OpArgType, PseudoInstruction, SpecialMethod,
+        UnpackExArgs,
     },
 };
 use rustpython_wtf8::Wtf8Buf;
@@ -153,6 +151,9 @@ struct Compiler {
     ctx: CompileContext,
     opts: CompileOpts,
     in_annotation: bool,
+    /// True when compiling in "single" (interactive) mode.
+    /// Expression statements at module scope emit CALL_INTRINSIC_1(Print).
+    interactive: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -211,7 +212,7 @@ enum ComprehensionType {
 }
 
 fn validate_duplicate_params(params: &ast::Parameters) -> Result<(), CodegenErrorType> {
-    let mut seen_params = HashSet::new();
+    let mut seen_params = IndexSet::default();
     for param in params {
         let param_name = param.name().as_str();
         if !seen_params.insert(param_name) {
@@ -463,6 +464,7 @@ impl Compiler {
             },
             opts,
             in_annotation: false,
+            interactive: false,
         }
     }
 
@@ -493,56 +495,46 @@ impl Compiler {
         slice: &ast::Expr,
         ctx: ast::ExprContext,
     ) -> CompileResult<()> {
-        // 1. Check subscripter and index for Load context
-        // 2. VISIT value
-        // 3. Handle two-element slice specially
-        // 4. Otherwise VISIT slice and emit appropriate instruction
-
-        // For Load context, some checks are skipped for now
-        // if ctx == ast::ExprContext::Load {
-        //     check_subscripter(value);
-        //     check_index(value, slice);
-        // }
+        // Save full subscript expression range (set by compile_expression before this call)
+        let subscript_range = self.current_source_range;
 
         // VISIT(c, expr, e->v.Subscript.value)
         self.compile_expression(value)?;
 
         // Handle two-element non-constant slice with BINARY_SLICE/STORE_SLICE
-        if slice.should_use_slice_optimization() && !matches!(ctx, ast::ExprContext::Del) {
+        let use_slice_opt = matches!(ctx, ast::ExprContext::Load | ast::ExprContext::Store)
+            && slice.should_use_slice_optimization();
+        if use_slice_opt {
             match slice {
                 ast::Expr::Slice(s) => self.compile_slice_two_parts(s)?,
                 _ => unreachable!(
                     "should_use_slice_optimization should only return true for ast::Expr::Slice"
                 ),
             };
-            match ctx {
-                ast::ExprContext::Load => {
-                    emit!(self, Instruction::BinarySlice);
-                }
-                ast::ExprContext::Store => {
-                    emit!(self, Instruction::StoreSlice);
-                }
-                _ => unreachable!(),
-            }
         } else {
             // VISIT(c, expr, e->v.Subscript.slice)
             self.compile_expression(slice)?;
+        }
 
-            // Emit appropriate instruction based on context
-            match ctx {
-                ast::ExprContext::Load => emit!(
-                    self,
-                    Instruction::BinaryOp {
-                        op: BinaryOperator::Subscr
-                    }
-                ),
-                ast::ExprContext::Store => emit!(self, Instruction::StoreSubscr),
-                ast::ExprContext::Del => emit!(self, Instruction::DeleteSubscr),
-                ast::ExprContext::Invalid => {
-                    return Err(self.error(CodegenErrorType::SyntaxError(
-                        "Invalid expression context".to_owned(),
-                    )));
+        // Restore full subscript expression range before emitting
+        self.set_source_range(subscript_range);
+
+        match (use_slice_opt, ctx) {
+            (true, ast::ExprContext::Load) => emit!(self, Instruction::BinarySlice),
+            (true, ast::ExprContext::Store) => emit!(self, Instruction::StoreSlice),
+            (true, _) => unreachable!(),
+            (false, ast::ExprContext::Load) => emit!(
+                self,
+                Instruction::BinaryOp {
+                    op: BinaryOperator::Subscr
                 }
+            ),
+            (false, ast::ExprContext::Store) => emit!(self, Instruction::StoreSubscr),
+            (false, ast::ExprContext::Del) => emit!(self, Instruction::DeleteSubscr),
+            (false, ast::ExprContext::Invalid) => {
+                return Err(self.error(CodegenErrorType::SyntaxError(
+                    "Invalid expression context".to_owned(),
+                )));
             }
         }
 
@@ -1083,7 +1075,7 @@ impl Compiler {
             ),
             CompilerScope::Annotation => (
                 bytecode::CodeFlags::NEWLOCALS | bytecode::CodeFlags::OPTIMIZED,
-                0,
+                1, // format is positional-only
                 1, // annotation scope takes one argument (format)
                 0,
             ),
@@ -1175,7 +1167,7 @@ impl Compiler {
                 arg: OpArgMarker::marker(),
             }
             .into(),
-            arg: OpArg(bytecode::ResumeType::AtFuncStart as u32),
+            arg: OpArg::new(u32::from(bytecode::ResumeType::AtFuncStart)),
             target: BlockIdx::NULL,
             location,
             end_location,
@@ -1244,17 +1236,15 @@ impl Compiler {
 
     /// Enter annotation scope using the symbol table's annotation_block
     /// Returns false if no annotation_block exists
-    fn enter_annotation_scope(&mut self, func_name: &str) -> CompileResult<bool> {
+    fn enter_annotation_scope(&mut self, _func_name: &str) -> CompileResult<bool> {
         if !self.push_annotation_symbol_table() {
             return Ok(false);
         }
 
         let key = self.symbol_table_stack.len() - 1;
         let lineno = self.get_source_line_number().get();
-        let annotate_name = format!("<annotate of {func_name}>");
-
         self.enter_scope(
-            &annotate_name,
+            "__annotate__",
             CompilerScope::Annotation,
             key,
             lineno.to_u32(),
@@ -1277,8 +1267,6 @@ impl Compiler {
     /// Emit format parameter validation for annotation scope
     /// if format > VALUE_WITH_FAKE_GLOBALS (2): raise NotImplementedError
     fn emit_format_validation(&mut self) -> CompileResult<()> {
-        use bytecode::ComparisonOperator::Greater;
-
         // Load format parameter (first local variable, index 0)
         emit!(self, Instruction::LoadFast(0));
 
@@ -1286,7 +1274,12 @@ impl Compiler {
         self.emit_load_const(ConstantData::Integer { value: 2.into() });
 
         // Compare: format > 2
-        emit!(self, Instruction::CompareOp { op: Greater });
+        emit!(
+            self,
+            Instruction::CompareOp {
+                op: ComparisonOperator::Greater
+            }
+        );
 
         // Jump to body if format <= 2 (comparison is false)
         let body_block = self.new_block();
@@ -1717,6 +1710,7 @@ impl Compiler {
         body: &[ast::Stmt],
         symbol_table: SymbolTable,
     ) -> CompileResult<()> {
+        self.interactive = true;
         // Set future_annotations from symbol table (detected during symbol table scan)
         self.future_annotations = symbol_table.future_annotations;
         self.symbol_table_stack.push(symbol_table);
@@ -1895,15 +1889,17 @@ impl Compiler {
 
         // Special handling for class scope implicit cell variables
         // These are treated as Cell even if not explicitly marked in symbol table
-        // Only for LOAD operations - explicit stores like `__class__ = property(...)`
-        // should use STORE_NAME to store in class namespace dict
+        // __class__ and __classdict__: only LOAD uses Cell (stores go to class namespace)
+        // __conditional_annotations__: both LOAD and STORE use Cell (it's a mutable set
+        // that the annotation scope accesses through the closure)
         let symbol_scope = {
             let current_table = self.current_symbol_table();
             if current_table.typ == CompilerScope::Class
-                && usage == NameUsage::Load
-                && (name == "__class__"
-                    || name == "__classdict__"
-                    || name == "__conditional_annotations__")
+                && ((usage == NameUsage::Load
+                    && (name == "__class__"
+                        || name == "__classdict__"
+                        || name == "__conditional_annotations__"))
+                    || (name == "__conditional_annotations__" && usage == NameUsage::Store))
             {
                 Some(SymbolScope::Cell)
             } else {
@@ -2072,11 +2068,19 @@ impl Compiler {
                     let idx = self.name(&name.name);
                     emit!(self, Instruction::ImportName { idx });
                     if let Some(alias) = &name.asname {
-                        for part in name.name.split('.').skip(1) {
+                        let parts: Vec<&str> = name.name.split('.').skip(1).collect();
+                        for (i, part) in parts.iter().enumerate() {
                             let idx = self.name(part);
-                            self.emit_load_attr(idx);
+                            emit!(self, Instruction::ImportFrom { idx });
+                            if i < parts.len() - 1 {
+                                emit!(self, Instruction::Swap { index: 2 });
+                                emit!(self, Instruction::PopTop);
+                            }
                         }
-                        self.store_name(alias.as_str())?
+                        self.store_name(alias.as_str())?;
+                        if !parts.is_empty() {
+                            emit!(self, Instruction::PopTop);
+                        }
                     } else {
                         self.store_name(name.name.split('.').next().unwrap())?
                     }
@@ -2152,7 +2156,15 @@ impl Compiler {
             ast::Stmt::Expr(ast::StmtExpr { value, .. }) => {
                 self.compile_expression(value)?;
 
-                // Pop result of stack, since we not use it:
+                if self.interactive && !self.ctx.in_func() && !self.ctx.in_class {
+                    emit!(
+                        self,
+                        Instruction::CallIntrinsic1 {
+                            func: bytecode::IntrinsicFunction1::Print
+                        }
+                    );
+                }
+
                 emit!(self, Instruction::PopTop);
             }
             ast::Stmt::Global(_) | ast::Stmt::Nonlocal(_) => {
@@ -2438,27 +2450,87 @@ impl Compiler {
                 });
 
                 if let Some(type_params) = type_params {
-                    // For TypeAlias, we need to use push_symbol_table to properly handle the TypeAlias scope
+                    // Outer scope for TypeParams
                     self.push_symbol_table()?;
+                    let key = self.symbol_table_stack.len() - 1;
+                    let lineno = self.get_source_line_number().get().to_u32();
+                    let scope_name = format!("<generic parameters of {name_string}>");
+                    self.enter_scope(&scope_name, CompilerScope::TypeParams, key, lineno)?;
 
-                    // Compile type params and push to stack
+                    // TypeParams scope is function-like
+                    let prev_ctx = self.ctx;
+                    self.ctx = CompileContext {
+                        loop_data: None,
+                        in_class: prev_ctx.in_class,
+                        func: FunctionContext::Function,
+                        in_async_scope: false,
+                    };
+
+                    // Compile type params inside the scope
                     self.compile_type_params(type_params)?;
-                    // Stack now has [name, type_params_tuple]
+                    // Stack: [type_params_tuple]
 
-                    // Compile value expression (can now see T1, T2)
+                    // Inner closure for lazy value evaluation
+                    self.push_symbol_table()?;
+                    let inner_key = self.symbol_table_stack.len() - 1;
+                    self.enter_scope("TypeAlias", CompilerScope::TypeParams, inner_key, lineno)?;
+                    // Evaluator takes a positional-only format parameter
+                    self.current_code_info().metadata.argcount = 1;
+                    self.current_code_info().metadata.posonlyargcount = 1;
+                    self.emit_format_validation()?;
                     self.compile_expression(value)?;
-                    // Stack: [name, type_params_tuple, value]
+                    emit!(self, Instruction::ReturnValue);
+                    let value_code = self.exit_scope();
+                    self.make_closure(value_code, bytecode::MakeFunctionFlags::empty())?;
+                    // Stack: [type_params_tuple, value_closure]
 
-                    // Pop the TypeAlias scope
-                    self.pop_symbol_table();
+                    // Swap so unpack_sequence reverse gives correct order
+                    emit!(self, Instruction::Swap { index: 2_u32 });
+                    // Stack: [value_closure, type_params_tuple]
+
+                    // Build tuple and return from TypeParams scope
+                    emit!(self, Instruction::BuildTuple { size: 2 });
+                    emit!(self, Instruction::ReturnValue);
+
+                    let code = self.exit_scope();
+                    self.ctx = prev_ctx;
+                    self.make_closure(code, bytecode::MakeFunctionFlags::empty())?;
+                    emit!(self, Instruction::PushNull);
+                    emit!(self, Instruction::Call { nargs: 0 });
+
+                    // Unpack: (value_closure, type_params_tuple)
+                    // UnpackSequence reverses → stack: [name, type_params_tuple, value_closure]
+                    emit!(self, Instruction::UnpackSequence { size: 2 });
                 } else {
                     // Push None for type_params
                     self.emit_load_const(ConstantData::None);
                     // Stack: [name, None]
 
-                    // Compile value expression
+                    // Create a closure for lazy evaluation of the value
+                    self.push_symbol_table()?;
+                    let key = self.symbol_table_stack.len() - 1;
+                    let lineno = self.get_source_line_number().get().to_u32();
+                    self.enter_scope("TypeAlias", CompilerScope::TypeParams, key, lineno)?;
+                    // Evaluator takes a positional-only format parameter
+                    self.current_code_info().metadata.argcount = 1;
+                    self.current_code_info().metadata.posonlyargcount = 1;
+                    self.emit_format_validation()?;
+
+                    let prev_ctx = self.ctx;
+                    self.ctx = CompileContext {
+                        loop_data: None,
+                        in_class: prev_ctx.in_class,
+                        func: FunctionContext::Function,
+                        in_async_scope: false,
+                    };
+
                     self.compile_expression(value)?;
-                    // Stack: [name, None, value]
+                    emit!(self, Instruction::ReturnValue);
+
+                    let code = self.exit_scope();
+                    self.ctx = prev_ctx;
+                    self.make_closure(code, bytecode::MakeFunctionFlags::empty())?;
+                    // Stack: [name, None, closure]
                 }
 
                 // Build tuple of 3 elements and call intrinsic
@@ -2584,6 +2656,21 @@ impl Compiler {
         // Enter scope with the type parameter name
         self.enter_scope(name, CompilerScope::TypeParams, key, lineno)?;
 
+        // Evaluator takes a positional-only format parameter
+        self.current_code_info().metadata.argcount = 1;
+        self.current_code_info().metadata.posonlyargcount = 1;
+
+        self.emit_format_validation()?;
+
+        // TypeParams scope is function-like
+        let prev_ctx = self.ctx;
+        self.ctx = CompileContext {
+            loop_data: None,
+            in_class: prev_ctx.in_class,
+            func: FunctionContext::Function,
+            in_async_scope: false,
+        };
+
         // Compile the expression
         if allow_starred && matches!(expr, ast::Expr::Starred(_)) {
             if let ast::Expr::Starred(starred) = expr {
@@ -2599,14 +2686,10 @@ impl Compiler {
 
         // Exit scope and create closure
         let code = self.exit_scope();
-        // Note: exit_scope already calls pop_symbol_table, so we don't need to call it again
+        self.ctx = prev_ctx;
 
-        // Create type params function with closure
+        // Create closure for lazy evaluation
         self.make_closure(code, bytecode::MakeFunctionFlags::empty())?;
-        emit!(self, Instruction::PushNull);
-
-        // Call the function immediately
-        emit!(self, Instruction::Call { nargs: 0 });
 
         Ok(())
     }
@@ -3845,16 +3928,8 @@ impl Compiler {
         // Check if we have conditional annotations
         let has_conditional = self.current_symbol_table().has_conditional_annotations;
 
-        // Get parent scope type and name BEFORE pushing annotation symbol table
+        // Get parent scope type BEFORE pushing annotation symbol table
         let parent_scope_type = self.current_symbol_table().typ;
-        let parent_name = self
-            .symbol_table_stack
-            .last()
-            .map(|t| t.name.as_str())
-            .unwrap_or("module")
-            .to_owned();
-        let scope_name = format!("<annotate of {parent_name}>");
-
         // Try to push annotation symbol table from current scope
         if !self.push_current_annotation_symbol_table() {
             return Ok(false);
@@ -3863,7 +3938,12 @@ impl Compiler {
         // Enter annotation scope for code generation
         let key = self.symbol_table_stack.len() - 1;
         let lineno = self.get_source_line_number().get();
-        self.enter_scope(&scope_name, CompilerScope::Annotation, key, lineno.to_u32())?;
+        self.enter_scope(
+            "__annotate__",
+            CompilerScope::Annotation,
+            key,
+            lineno.to_u32(),
+        )?;
 
         // Add 'format' parameter to varnames
         self.current_code_info()
@@ -3992,6 +4072,9 @@ impl Compiler {
         let is_generic = type_params.is_some();
         let mut num_typeparam_args = 0;
 
+        // Save context before entering TypeParams scope
+        let saved_ctx = self.ctx;
+
         if is_generic {
             // Count args to pass to type params scope
             if funcflags.contains(bytecode::MakeFunctionFlags::DEFAULTS) {
@@ -4010,6 +4093,14 @@ impl Compiler {
                 0,
                 type_params_name,
             )?;
+
+            // TypeParams scope is function-like
+            self.ctx = CompileContext {
+                loop_data: None,
+                in_class: saved_ctx.in_class,
+                func: FunctionContext::Function,
+                in_async_scope: false,
+            };
 
             // Add parameter names to varnames for the type params scope
             // These will be passed as arguments when the closure is called
@@ -4069,6 +4160,7 @@ impl Compiler {
 
             // Exit type params scope and create closure
             let type_params_code = self.exit_scope();
+            self.ctx = saved_ctx;
 
             // Make closure for type params code
             self.make_closure(type_params_code, bytecode::MakeFunctionFlags::empty())?;
@@ -4317,12 +4409,26 @@ impl Compiler {
                     Self::find_ann(body) || Self::find_ann(orelse)
                 }
                 ast::Stmt::With(ast::StmtWith { body, .. }) => Self::find_ann(body),
+                ast::Stmt::Match(ast::StmtMatch { cases, .. }) => {
+                    cases.iter().any(|case| Self::find_ann(&case.body))
+                }
                 ast::Stmt::Try(ast::StmtTry {
                     body,
+                    handlers,
                     orelse,
                     finalbody,
                     ..
-                }) => Self::find_ann(body) || Self::find_ann(orelse) || Self::find_ann(finalbody),
+                }) => {
+                    Self::find_ann(body)
+                        || handlers.iter().any(|h| {
+                            let ast::ExceptHandler::ExceptHandler(
+                                ast::ExceptHandlerExceptHandler { body, .. },
+                            ) = h;
+                            Self::find_ann(body)
+                        })
+                        || Self::find_ann(orelse)
+                        || Self::find_ann(finalbody)
+                }
                 _ => false,
             };
             if res {
@@ -4459,6 +4565,9 @@ impl Compiler {
         let is_generic = type_params.is_some();
         let firstlineno = self.get_source_line_number().get().to_u32();
 
+        // Save context before entering any scopes
+        let saved_ctx = self.ctx;
+
         // Step 1: If generic, enter type params scope and compile type params
         if is_generic {
             let type_params_name = format!("<generic parameters of {name}>");
@@ -4472,6 +4581,14 @@ impl Compiler {
 
             // Set private name for name mangling
             self.code_stack.last_mut().unwrap().private = Some(name.to_owned());
+
+            // TypeParams scope is function-like
+            self.ctx = CompileContext {
+                loop_data: None,
+                in_class: saved_ctx.in_class,
+                func: FunctionContext::Function,
+                in_async_scope: false,
+            };
 
             // Compile type parameters and store as .type_params
             self.compile_type_params(type_params.unwrap())?;
@@ -4623,6 +4740,7 @@ impl Compiler {
 
             // Exit type params scope and wrap in function
             let type_params_code = self.exit_scope();
+            self.ctx = saved_ctx;
 
             // Execute the type params function
             self.make_closure(type_params_code, bytecode::MakeFunctionFlags::empty())?;
@@ -5531,13 +5649,13 @@ impl Compiler {
                 "too many sub-patterns in mapping pattern".to_string(),
             )));
         }
-        #[allow(clippy::cast_possible_truncation)]
-        let size = size as u32; // checked right before
+        #[allow(clippy::cast_possible_truncation, reason = "checked right before")]
+        let size = size as u32;
 
         // Step 2: If we have keys to match
         if size > 0 {
             // Validate and compile keys
-            let mut seen = HashSet::new();
+            let mut seen = IndexSet::default();
             for key in keys {
                 let is_attribute = matches!(key, ast::Expr::Attribute(_));
                 let is_literal = matches!(
@@ -6181,8 +6299,7 @@ impl Compiler {
 
                     // Only add to __conditional_annotations__ set if actually conditional
                     if is_conditional {
-                        let cond_annotations_name = self.name("__conditional_annotations__");
-                        emit!(self, Instruction::LoadName(cond_annotations_name));
+                        self.load_name("__conditional_annotations__")?;
                         self.emit_load_const(ConstantData::Integer {
                             value: annotation_index.into(),
                         });
@@ -6555,9 +6672,9 @@ impl Compiler {
             self,
             Instruction::Resume {
                 arg: if is_await {
-                    bytecode::ResumeType::AfterAwait as u32
+                    u32::from(bytecode::ResumeType::AfterAwait)
                 } else {
-                    bytecode::ResumeType::AfterYieldFrom as u32
+                    u32::from(bytecode::ResumeType::AfterYieldFrom)
                 }
             }
         );
@@ -6603,7 +6720,8 @@ impl Compiler {
                 self.compile_expression(left)?;
                 self.compile_expression(right)?;
 
-                // Perform operation:
+                // Restore full expression range before emitting the operation
+                self.set_source_range(range);
                 self.compile_op(op, false);
             }
             ast::Expr::Subscript(ast::ExprSubscript {
@@ -6614,7 +6732,8 @@ impl Compiler {
             ast::Expr::UnaryOp(ast::ExprUnaryOp { op, operand, .. }) => {
                 self.compile_expression(operand)?;
 
-                // Perform operation:
+                // Restore full expression range before emitting the operation
+                self.set_source_range(range);
                 match op {
                     ast::UnaryOp::UAdd => emit!(
                         self,
@@ -6710,7 +6829,7 @@ impl Compiler {
                 emit!(
                     self,
                     Instruction::Resume {
-                        arg: bytecode::ResumeType::AfterYield as u32
+                        arg: u32::from(bytecode::ResumeType::AfterYield)
                     }
                 );
             }
@@ -6932,7 +7051,7 @@ impl Compiler {
                         emit!(
                             compiler,
                             Instruction::Resume {
-                                arg: bytecode::ResumeType::AfterYield as u32
+                                arg: u32::from(bytecode::ResumeType::AfterYield)
                             }
                         );
                         emit!(compiler, Instruction::PopTop);
@@ -7402,7 +7521,7 @@ impl Compiler {
         let return_none = init_collection.is_none();
         // Create empty object of proper type:
         if let Some(init_collection) = init_collection {
-            self._emit(init_collection, OpArg(0), BlockIdx::NULL)
+            self._emit(init_collection, OpArg::new(0), BlockIdx::NULL)
         }
 
         let mut loop_labels = vec![];
@@ -7598,7 +7717,7 @@ impl Compiler {
         // Step 4: Create the collection (list/set/dict)
         // For generator expressions, init_collection is None
         if let Some(init_collection) = init_collection {
-            self._emit(init_collection, OpArg(0), BlockIdx::NULL);
+            self._emit(init_collection, OpArg::new(0), BlockIdx::NULL);
             // SWAP to get iterator on top
             emit!(self, Instruction::Swap { index: 2 });
         }
@@ -7772,7 +7891,7 @@ impl Compiler {
     }
 
     fn emit_no_arg<I: Into<AnyInstruction>>(&mut self, ins: I) {
-        self._emit(ins, OpArg::null(), BlockIdx::NULL)
+        self._emit(ins, OpArg::NULL, BlockIdx::NULL)
     }
 
     fn emit_arg<A: OpArgType, T: EmitArg<A>, I: Into<AnyInstruction>>(
@@ -7804,42 +7923,64 @@ impl Compiler {
     /// Emit LOAD_ATTR for attribute access (method=false).
     /// Encodes: (name_idx << 1) | 0
     fn emit_load_attr(&mut self, name_idx: u32) {
-        let encoded = encode_load_attr_arg(name_idx, false);
+        let encoded = LoadAttr::builder()
+            .name_idx(name_idx)
+            .is_method(false)
+            .build();
         self.emit_arg(encoded, |arg| Instruction::LoadAttr { idx: arg })
     }
 
     /// Emit LOAD_ATTR with method flag set (for method calls).
     /// Encodes: (name_idx << 1) | 1
     fn emit_load_attr_method(&mut self, name_idx: u32) {
-        let encoded = encode_load_attr_arg(name_idx, true);
+        let encoded = LoadAttr::builder()
+            .name_idx(name_idx)
+            .is_method(true)
+            .build();
         self.emit_arg(encoded, |arg| Instruction::LoadAttr { idx: arg })
     }
 
     /// Emit LOAD_SUPER_ATTR for 2-arg super().attr access.
     /// Encodes: (name_idx << 2) | 0b10 (method=0, class=1)
     fn emit_load_super_attr(&mut self, name_idx: u32) {
-        let encoded = encode_load_super_attr_arg(name_idx, false, true);
+        let encoded = LoadSuperAttr::builder()
+            .name_idx(name_idx)
+            .is_load_method(false)
+            .has_class(true)
+            .build();
         self.emit_arg(encoded, |arg| Instruction::LoadSuperAttr { arg })
     }
 
     /// Emit LOAD_SUPER_ATTR for 2-arg super().method() call.
     /// Encodes: (name_idx << 2) | 0b11 (method=1, class=1)
     fn emit_load_super_method(&mut self, name_idx: u32) {
-        let encoded = encode_load_super_attr_arg(name_idx, true, true);
+        let encoded = LoadSuperAttr::builder()
+            .name_idx(name_idx)
+            .is_load_method(true)
+            .has_class(true)
+            .build();
         self.emit_arg(encoded, |arg| Instruction::LoadSuperAttr { arg })
     }
 
     /// Emit LOAD_SUPER_ATTR for 0-arg super().attr access.
     /// Encodes: (name_idx << 2) | 0b00 (method=0, class=0)
     fn emit_load_zero_super_attr(&mut self, name_idx: u32) {
-        let encoded = encode_load_super_attr_arg(name_idx, false, false);
+        let encoded = LoadSuperAttr::builder()
+            .name_idx(name_idx)
+            .is_load_method(false)
+            .has_class(false)
+            .build();
         self.emit_arg(encoded, |arg| Instruction::LoadSuperAttr { arg })
     }
 
     /// Emit LOAD_SUPER_ATTR for 0-arg super().method() call.
     /// Encodes: (name_idx << 2) | 0b01 (method=1, class=0)
     fn emit_load_zero_super_method(&mut self, name_idx: u32) {
-        let encoded = encode_load_super_attr_arg(name_idx, true, false);
+        let encoded = LoadSuperAttr::builder()
+            .name_idx(name_idx)
+            .is_load_method(true)
+            .has_class(false)
+            .build();
         self.emit_arg(encoded, |arg| Instruction::LoadSuperAttr { arg })
     }
 
@@ -8317,7 +8458,7 @@ impl Compiler {
         }
 
         // Add trailing string
-        all_strings.push(std::mem::take(&mut current_string));
+        all_strings.push(core::mem::take(&mut current_string));
 
         // Now build the Template:
         // Stack currently has all interpolations from compile_tstring_into calls
@@ -8361,14 +8502,24 @@ impl Compiler {
                 }
                 ast::InterpolatedStringElement::Interpolation(interp) => {
                     // Finish current string segment
-                    strings.push(std::mem::take(current_string));
+                    strings.push(core::mem::take(current_string));
 
                     // Compile the interpolation value
                     self.compile_expression(&interp.expression)?;
 
-                    // Load the expression source string
+                    // Load the expression source string, including any
+                    // whitespace between '{' and the expression start
                     let expr_range = interp.expression.range();
-                    let expr_source = self.source_file.slice(expr_range);
+                    let expr_source = if interp.range.start() < expr_range.start()
+                        && interp.range.end() >= expr_range.end()
+                    {
+                        let after_brace = interp.range.start() + TextSize::new(1);
+                        self.source_file
+                            .slice(TextRange::new(after_brace, expr_range.end()))
+                    } else {
+                        // Fallback for programmatically constructed ASTs with dummy ranges
+                        self.source_file.slice(expr_range)
+                    };
                     self.emit_load_const(ConstantData::Str {
                         value: expr_source.to_string().into(),
                     });
@@ -8394,7 +8545,7 @@ impl Compiler {
 
                     // Emit BUILD_INTERPOLATION
                     // oparg encoding: (conversion << 2) | has_format_spec
-                    let oparg = (conversion << 2) | (has_format_spec as u32);
+                    let oparg = (conversion << 2) | u32::from(has_format_spec);
                     emit!(self, Instruction::BuildInterpolation { oparg });
 
                     *interp_count += 1;
@@ -8428,7 +8579,7 @@ impl EmitArg<bytecode::Label> for BlockIdx {
         self,
         f: impl FnOnce(OpArgMarker<bytecode::Label>) -> I,
     ) -> (AnyInstruction, OpArg, BlockIdx) {
-        (f(OpArgMarker::marker()).into(), OpArg::null(), self)
+        (f(OpArgMarker::marker()).into(), OpArg::NULL, self)
     }
 }
 

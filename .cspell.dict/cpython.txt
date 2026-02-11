@@ -10,6 +10,7 @@ badcert
 badsyntax
 baseinfo
 basetype
+binop
 boolop
 BUILDSTDLIB
 bxor
@@ -30,6 +31,7 @@ CLASSDEREF
 classdict
 cmpop
 codedepth
+constevaluator
 CODEUNIT
 CONVFUNC
 convparam
@@ -73,6 +75,7 @@ HASPOINTER
 HASSTRUCT
 HASUNION
 heaptype
+hexdigit
 HIGHRES
 IFUNC
 IMMUTABLETYPE

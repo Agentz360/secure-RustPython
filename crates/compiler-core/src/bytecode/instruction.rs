@@ -5,9 +5,9 @@ use crate::{
         BorrowedConstant, Constant, InstrDisplayContext,
         oparg::{
             BinaryOperator, BuildSliceArgCount, CommonConstant, ComparisonOperator,
-            ConvertValueOparg, IntrinsicFunction1, IntrinsicFunction2, Invert, Label,
-            MakeFunctionFlags, NameIdx, OpArg, OpArgByte, OpArgType, RaiseKind, SpecialMethod,
-            UnpackExArgs,
+            ConvertValueOparg, IntrinsicFunction1, IntrinsicFunction2, Invert, Label, LoadAttr,
+            LoadSuperAttr, MakeFunctionFlags, NameIdx, OpArg, OpArgByte, OpArgType, RaiseKind,
+            SpecialMethod, UnpackExArgs,
         },
     },
     marshal::MarshalError,
@@ -168,7 +168,7 @@ pub enum Instruction {
         i: Arg<u32>,
     } = 79,
     LoadAttr {
-        idx: Arg<NameIdx>,
+        idx: Arg<LoadAttr>,
     } = 80,
     LoadCommonConstant {
         idx: Arg<CommonConstant>,
@@ -198,7 +198,7 @@ pub enum Instruction {
         method: Arg<SpecialMethod>,
     } = 95,
     LoadSuperAttr {
-        arg: Arg<u32>,
+        arg: Arg<LoadSuperAttr>,
     } = 96,
     MakeCell(Arg<NameIdx>) = 97,
     MapAdd {
@@ -815,17 +815,17 @@ impl InstructionMetadata for Instruction {
             Self::ListAppend { i } => w!(LIST_APPEND, i),
             Self::ListExtend { i } => w!(LIST_EXTEND, i),
             Self::LoadAttr { idx } => {
-                let encoded = idx.get(arg);
-                let (name_idx, is_method) = decode_load_attr_arg(encoded);
-                let attr_name = name(name_idx);
-                if is_method {
+                let oparg = idx.get(arg);
+                let oparg_u32 = u32::from(oparg);
+                let attr_name = name(oparg.name_idx());
+                if oparg.is_method() {
                     write!(
                         f,
                         "{:pad$}({}, {}, method=true)",
-                        "LOAD_ATTR", encoded, attr_name
+                        "LOAD_ATTR", oparg_u32, attr_name
                     )
                 } else {
-                    write!(f, "{:pad$}({}, {})", "LOAD_ATTR", encoded, attr_name)
+                    write!(f, "{:pad$}({}, {})", "LOAD_ATTR", oparg_u32, attr_name)
                 }
             }
             Self::LoadBuildClass => w!(LOAD_BUILD_CLASS),
@@ -862,13 +862,15 @@ impl InstructionMetadata for Instruction {
             Self::LoadName(idx) => w!(LOAD_NAME, name = idx),
             Self::LoadSpecial { method } => w!(LOAD_SPECIAL, method),
             Self::LoadSuperAttr { arg: idx } => {
-                let encoded = idx.get(arg);
-                let (name_idx, load_method, has_class) = decode_load_super_attr_arg(encoded);
-                let attr_name = name(name_idx);
+                let oparg = idx.get(arg);
                 write!(
                     f,
                     "{:pad$}({}, {}, method={}, class={})",
-                    "LOAD_SUPER_ATTR", encoded, attr_name, load_method, has_class
+                    "LOAD_SUPER_ATTR",
+                    u32::from(oparg),
+                    name(oparg.name_idx()),
+                    oparg.is_load_method(),
+                    oparg.has_class()
                 )
             }
             Self::MakeFunction => w!(MAKE_FUNCTION),
@@ -1247,7 +1249,7 @@ impl<T: OpArgType> Arg<T> {
 
     #[inline]
     pub fn new(arg: T) -> (Self, OpArg) {
-        (Self(PhantomData), OpArg(arg.to_op_arg()))
+        (Self(PhantomData), OpArg::new(arg.into()))
     }
 
     #[inline]
@@ -1255,7 +1257,7 @@ impl<T: OpArgType> Arg<T> {
     where
         T: Into<u8>,
     {
-        (Self(PhantomData), OpArgByte(arg.into()))
+        (Self(PhantomData), OpArgByte::new(arg.into()))
     }
 
     #[inline(always)]
@@ -1265,7 +1267,7 @@ impl<T: OpArgType> Arg<T> {
 
     #[inline(always)]
     pub fn try_get(self, arg: OpArg) -> Result<T, MarshalError> {
-        T::from_op_arg(arg.0)
+        T::try_from(u32::from(arg)).map_err(|_| MarshalError::InvalidBytecode)
     }
 
     /// # Safety
@@ -1273,7 +1275,7 @@ impl<T: OpArgType> Arg<T> {
     #[inline(always)]
     pub unsafe fn get_unchecked(self, arg: OpArg) -> T {
         // SAFETY: requirements forwarded from caller
-        unsafe { T::from_op_arg(arg.0).unwrap_unchecked() }
+        unsafe { T::try_from(u32::from(arg)).unwrap_unchecked() }
     }
 }
 
@@ -1289,33 +1291,4 @@ impl<T: OpArgType> fmt::Debug for Arg<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Arg<{}>", core::any::type_name::<T>())
     }
-}
-
-/// Encode LOAD_ATTR oparg: bit 0 = method flag, bits 1+ = name index.
-#[inline]
-pub const fn encode_load_attr_arg(name_idx: u32, is_method: bool) -> u32 {
-    (name_idx << 1) | (is_method as u32)
-}
-
-/// Decode LOAD_ATTR oparg: returns (name_idx, is_method).
-#[inline]
-pub const fn decode_load_attr_arg(oparg: u32) -> (u32, bool) {
-    let is_method = (oparg & 1) == 1;
-    let name_idx = oparg >> 1;
-    (name_idx, is_method)
-}
-
-/// Encode LOAD_SUPER_ATTR oparg: bit 0 = load_method, bit 1 = has_class, bits 2+ = name index.
-#[inline]
-pub const fn encode_load_super_attr_arg(name_idx: u32, load_method: bool, has_class: bool) -> u32 {
-    (name_idx << 2) | ((has_class as u32) << 1) | (load_method as u32)
-}
-
-/// Decode LOAD_SUPER_ATTR oparg: returns (name_idx, load_method, has_class).
-#[inline]
-pub const fn decode_load_super_attr_arg(oparg: u32) -> (u32, bool, bool) {
-    let load_method = (oparg & 1) == 1;
-    let has_class = (oparg & 2) == 2;
-    let name_idx = oparg >> 2;
-    (name_idx, load_method, has_class)
 }

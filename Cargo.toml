@@ -10,7 +10,8 @@ repository.workspace = true
 license.workspace = true
 
 [features]
-default = ["threading", "stdlib", "stdio", "importlib", "ssl-rustls"]
+default = ["threading", "stdlib", "stdio", "importlib", "ssl-rustls", "host_env"]
+host_env = ["rustpython-vm/host_env", "rustpython-stdlib?/host_env"]
 importlib = ["rustpython-vm/importlib"]
 encodings = ["rustpython-vm/encodings"]
 stdio = ["rustpython-vm/stdio"]
@@ -177,13 +178,12 @@ nix = { version = "0.30", features = ["fs", "user", "process", "term", "time", "
 malachite-bigint = "0.9.1"
 malachite-q = "0.9.1"
 malachite-base = "0.9.1"
-memchr = "2.7.4"
+memchr = "2.8.0"
 num-complex = "0.4.6"
 num-integer = "0.1.46"
 num-traits = "0.2"
 num_enum = { version = "0.7", default-features = false }
 optional = "0.5"
-once_cell = "1.20.3"
 parking_lot = "0.12.3"
 paste = "1.0.15"
 proc-macro2 = "1.0.105"
@@ -225,9 +225,9 @@ unsafe_op_in_unsafe_fn = "deny"
 elided_lifetimes_in_paths = "warn"
 
 [workspace.lints.clippy]
-# alloc_instead_of_core = "warn"
-# std_instead_of_alloc = "warn"
-# std_instead_of_core = "warn"
+alloc_instead_of_core = "warn"
+std_instead_of_alloc = "warn"
+std_instead_of_core = "warn"
 perf = "warn"
 style = "warn"
 complexity = "warn"

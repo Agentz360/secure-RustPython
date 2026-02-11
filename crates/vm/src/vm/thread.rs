@@ -2,14 +2,14 @@ use crate::frame::Frame;
 #[cfg(feature = "threading")]
 use crate::frame::FrameRef;
 use crate::{AsObject, PyObject, VirtualMachine};
+#[cfg(feature = "threading")]
+use alloc::sync::Arc;
 use core::{
     cell::{Cell, RefCell},
     ptr::NonNull,
     sync::atomic::{AtomicPtr, Ordering},
 };
 use itertools::Itertools;
-#[cfg(feature = "threading")]
-use std::sync::Arc;
 use std::thread_local;
 
 /// Type for current frame slot - shared between threads for sys._current_frames()
@@ -270,11 +270,12 @@ impl VirtualMachine {
             wasm_id: self.wasm_id.clone(),
             exceptions: RefCell::default(),
             import_func: self.import_func.clone(),
+            importlib: self.importlib.clone(),
             profile_func: RefCell::new(global_profile.unwrap_or_else(|| self.ctx.none())),
             trace_func: RefCell::new(global_trace.unwrap_or_else(|| self.ctx.none())),
             use_tracing: Cell::new(use_tracing),
             recursion_limit: self.recursion_limit.clone(),
-            signal_handlers: None,
+            signal_handlers: core::cell::OnceCell::new(),
             signal_rx: None,
             repr_guards: RefCell::default(),
             state: self.state.clone(),

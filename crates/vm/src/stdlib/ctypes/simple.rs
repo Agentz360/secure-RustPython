@@ -1179,9 +1179,13 @@ impl PyCSimple {
                 }
                 #[cfg(not(windows))]
                 {
+                    #[allow(
+                        clippy::useless_conversion,
+                        reason = "wchar_t is i32 on some platforms and u32 on others"
+                    )]
                     let s: String = wchars
                         .iter()
-                        .filter_map(|&c| char::from_u32(c as u32))
+                        .filter_map(|&c| u32::try_from(c).ok().and_then(char::from_u32))
                         .collect();
                     return Ok(vm.ctx.new_str(s).into());
                 }

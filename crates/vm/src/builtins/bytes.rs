@@ -1,7 +1,8 @@
 use super::{
     PositionIterInternal, PyDictRef, PyGenericAlias, PyIntRef, PyStrRef, PyTuple, PyTupleRef,
-    PyType, PyTypeRef,
+    PyType, PyTypeRef, iter::builtins_iter,
 };
+use crate::common::lock::LazyLock;
 use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
     TryFromBorrowedObject, TryFromObject, VirtualMachine,
@@ -30,7 +31,6 @@ use crate::{
 };
 use bstr::ByteSlice;
 use core::{mem::size_of, ops::Deref};
-use std::sync::LazyLock;
 
 #[pyclass(module = false, name = "bytes")]
 #[derive(Clone, Debug)]
@@ -747,9 +747,13 @@ impl PyBytesIterator {
 
     #[pymethod]
     fn __reduce__(&self, vm: &VirtualMachine) -> PyTupleRef {
-        self.internal
-            .lock()
-            .builtins_iter_reduce(|x| x.clone().into(), vm)
+        let func = builtins_iter(vm);
+        self.internal.lock().reduce(
+            func,
+            |x| x.clone().into(),
+            |vm| vm.ctx.empty_tuple.clone().into(),
+            vm,
+        )
     }
 
     #[pymethod]
