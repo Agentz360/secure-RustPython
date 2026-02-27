@@ -5,7 +5,7 @@ use crate::{
     builtins::{
         PyBaseException, PyBaseExceptionRef, PyCode, PyCoroutine, PyDict, PyDictRef, PyGenerator,
         PyInterpolation, PyList, PySet, PySlice, PyStr, PyStrInterned, PyTemplate, PyTraceback,
-        PyType,
+        PyType, PyUtf8Str,
         asyncgenerator::PyAsyncGenWrappedValue,
         function::{PyCell, PyCellRef, PyFunction},
         tuple::{PyTuple, PyTupleRef},
@@ -24,13 +24,18 @@ use crate::{
     vm::{Context, PyMethod},
 };
 use alloc::fmt;
+use bstr::ByteSlice;
 use core::iter::zip;
 use core::sync::atomic;
 use core::sync::atomic::AtomicPtr;
 use indexmap::IndexMap;
 use itertools::Itertools;
 
-use rustpython_common::{boxvec::BoxVec, lock::PyMutex, wtf8::Wtf8Buf};
+use rustpython_common::{
+    boxvec::BoxVec,
+    lock::PyMutex,
+    wtf8::{Wtf8, Wtf8Buf, wtf8_concat},
+};
 use rustpython_compiler_core::SourceLocation;
 
 pub type FrameRef = PyRef<Frame>;
@@ -53,6 +58,8 @@ struct FrameState {
     // We need 1 stack per frame
     /// The main data frame of the stack machine
     stack: BoxVec<Option<PyObjectRef>>,
+    /// Cell and free variable references (cellvars + freevars).
+    cells_frees: Box<[PyCellRef]>,
     /// index of last instruction ran
     #[cfg(feature = "threading")]
     lasti: u32,
@@ -93,7 +100,6 @@ pub struct Frame {
     pub func_obj: Option<PyObjectRef>,
 
     pub fastlocals: PyMutex<Box<[Option<PyObjectRef>]>>,
-    pub(crate) cells_frees: Box<[PyCellRef]>,
     pub locals: ArgMapping,
     pub globals: PyDictRef,
     pub builtins: PyObjectRef,
@@ -135,6 +141,7 @@ impl PyPayload for Frame {
 unsafe impl Traverse for FrameState {
     fn traverse(&self, tracer_fn: &mut TraverseFn<'_>) {
         self.stack.traverse(tracer_fn);
+        self.cells_frees.traverse(tracer_fn);
     }
 }
 
@@ -143,7 +150,6 @@ unsafe impl Traverse for Frame {
         self.code.traverse(tracer_fn);
         self.func_obj.traverse(tracer_fn);
         self.fastlocals.traverse(tracer_fn);
-        self.cells_frees.traverse(tracer_fn);
         self.locals.traverse(tracer_fn);
         self.globals.traverse(tracer_fn);
         self.builtins.traverse(tracer_fn);
@@ -193,13 +199,13 @@ impl Frame {
 
         let state = FrameState {
             stack: BoxVec::new(code.max_stackdepth as usize),
+            cells_frees,
             #[cfg(feature = "threading")]
             lasti: 0,
         };
 
         Self {
             fastlocals: PyMutex::new(fastlocals_vec.into_boxed_slice()),
-            cells_frees,
             locals: scope.locals,
             globals: scope.globals,
             builtins,
@@ -218,9 +224,38 @@ impl Frame {
         }
     }
 
-    /// Clear the evaluation stack. Used by frame.clear() to break reference cycles.
-    pub(crate) fn clear_value_stack(&self) {
-        self.state.lock().stack.clear();
+    /// Clear evaluation stack and state-owned cell/free references.
+    /// For full local/cell cleanup, call `clear_locals_and_stack()`.
+    pub(crate) fn clear_stack_and_cells(&self) {
+        let mut state = self.state.lock();
+        state.stack.clear();
+        let _old = core::mem::take(&mut state.cells_frees);
+    }
+
+    /// Clear locals and stack after generator/coroutine close.
+    /// Releases references held by the frame, matching _PyFrame_ClearLocals.
+    pub(crate) fn clear_locals_and_stack(&self) {
+        self.clear_stack_and_cells();
+        let mut fastlocals = self.fastlocals.lock();
+        for slot in fastlocals.iter_mut() {
+            *slot = None;
+        }
+    }
+
+    /// Get cell contents by cell index. Reads through fastlocals (no state lock needed).
+    pub(crate) fn get_cell_contents(&self, cell_idx: usize) -> Option<PyObjectRef> {
+        let nlocals = self.code.varnames.len();
+        let fastlocals = self.fastlocals.lock();
+        fastlocals
+            .get(nlocals + cell_idx)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|obj| obj.downcast_ref::<PyCell>())
+            .and_then(|cell| cell.get())
+    }
+
+    /// Set cell contents by cell index. Only safe to call before frame execution starts.
+    pub(crate) fn set_cell_contents(&self, cell_idx: usize, value: Option<PyObjectRef>) {
+        self.state.lock().cells_frees[cell_idx].set(value);
     }
 
     /// Store a borrowed back-reference to the owning generator/coroutine.
@@ -296,23 +331,25 @@ impl Frame {
             }
         }
         if !code.cellvars.is_empty() || !code.freevars.is_empty() {
-            let map_to_dict = |keys: &[&PyStrInterned], values: &[PyCellRef]| {
-                for (&k, v) in zip(keys, values) {
-                    if let Some(value) = v.get() {
-                        locals.mapping().ass_subscript(k, Some(value), vm)?;
-                    } else {
-                        match locals.mapping().ass_subscript(k, None, vm) {
-                            Ok(()) => {}
-                            Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => {}
-                            Err(e) => return Err(e),
-                        }
+            // Access cells through fastlocals to avoid locking state
+            // (state may be held by with_exec during frame execution).
+            for (i, &k) in code.cellvars.iter().enumerate() {
+                let cell_value = self.get_cell_contents(i);
+                match locals.mapping().ass_subscript(k, cell_value, vm) {
+                    Ok(()) => {}
+                    Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            if code.flags.contains(bytecode::CodeFlags::OPTIMIZED) {
+                for (i, &k) in code.freevars.iter().enumerate() {
+                    let cell_value = self.get_cell_contents(code.cellvars.len() + i);
+                    match locals.mapping().ass_subscript(k, cell_value, vm) {
+                        Ok(()) => {}
+                        Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => {}
+                        Err(e) => return Err(e),
                     }
                 }
-                Ok(())
-            };
-            map_to_dict(&code.cellvars, &self.cells_frees)?;
-            if code.flags.contains(bytecode::CodeFlags::OPTIMIZED) {
-                map_to_dict(&code.freevars, &self.cells_frees[code.cellvars.len()..])?;
             }
         }
         Ok(locals.clone())
@@ -326,7 +363,6 @@ impl Py<Frame> {
         let exec = ExecutingFrame {
             code: &self.code,
             fastlocals: &self.fastlocals,
-            cells_frees: &self.cells_frees,
             locals: &self.locals,
             globals: &self.globals,
             builtins: &self.builtins,
@@ -372,7 +408,6 @@ impl Py<Frame> {
         let exec = ExecutingFrame {
             code: &self.code,
             fastlocals: &self.fastlocals,
-            cells_frees: &self.cells_frees,
             locals: &self.locals,
             globals: &self.globals,
             builtins: &self.builtins,
@@ -386,8 +421,8 @@ impl Py<Frame> {
     pub fn is_internal_frame(&self) -> bool {
         let code = self.f_code();
         let filename = code.co_filename();
-        let filename_s = filename.as_str();
-        filename_s.contains("importlib") && filename_s.contains("_bootstrap")
+        let filename = filename.as_bytes();
+        filename.find(b"importlib").is_some() && filename.find(b"_bootstrap").is_some()
     }
 
     pub fn next_external_frame(&self, vm: &VirtualMachine) -> Option<FrameRef> {
@@ -407,7 +442,6 @@ impl Py<Frame> {
 struct ExecutingFrame<'a> {
     code: &'a PyRef<PyCode>,
     fastlocals: &'a PyMutex<Box<[Option<PyObjectRef>]>>,
-    cells_frees: &'a [PyCellRef],
     locals: &'a ArgMapping,
     globals: &'a PyDictRef,
     builtins: &'a PyObjectRef,
@@ -766,7 +800,7 @@ impl ExecutingFrame<'_> {
         if let Some(&name) = self.code.cellvars.get(i) {
             vm.new_exception_msg(
                 vm.ctx.exceptions.unbound_local_error.to_owned(),
-                format!("local variable '{name}' referenced before assignment"),
+                format!("local variable '{name}' referenced before assignment").into(),
             )
         } else {
             let name = self.code.freevars[i - self.code.cellvars.len()];
@@ -1011,7 +1045,7 @@ impl ExecutingFrame<'_> {
             }
             Instruction::DeleteAttr { idx } => self.delete_attr(vm, idx.get(arg)),
             Instruction::DeleteDeref(i) => {
-                self.cells_frees[i.get(arg) as usize].set(None);
+                self.state.cells_frees[i.get(arg) as usize].set(None);
                 Ok(None)
             }
             Instruction::DeleteFast(idx) => {
@@ -1023,7 +1057,8 @@ impl ExecutingFrame<'_> {
                         format!(
                             "local variable '{}' referenced before assignment",
                             self.code.varnames[idx]
-                        ),
+                        )
+                        .into(),
                     ));
                 }
                 fastlocals[idx] = None;
@@ -1128,7 +1163,7 @@ impl ExecutingFrame<'_> {
                         return Err(vm.new_type_error(format!(
                             "{} got multiple values for keyword argument '{}'",
                             func_str,
-                            key_str.as_str()
+                            key_str.as_wtf8()
                         )));
                     }
                     let value = vm.call_method(&source, "__getitem__", (key.clone(),))?;
@@ -1436,7 +1471,7 @@ impl ExecutingFrame<'_> {
                 };
                 self.push_value(match value {
                     Some(v) => v,
-                    None => self.cells_frees[i]
+                    None => self.state.cells_frees[i]
                         .get()
                         .ok_or_else(|| self.unbound_cell_exception(i, vm))?,
                 });
@@ -1493,7 +1528,7 @@ impl ExecutingFrame<'_> {
             }
             Instruction::LoadDeref(i) => {
                 let idx = i.get(arg) as usize;
-                let x = self.cells_frees[idx]
+                let x = self.state.cells_frees[idx]
                     .get()
                     .ok_or_else(|| self.unbound_cell_exception(idx, vm))?;
                 self.push_value(x);
@@ -1507,7 +1542,7 @@ impl ExecutingFrame<'_> {
                 ) -> PyBaseExceptionRef {
                     vm.new_exception_msg(
                         vm.ctx.exceptions.unbound_local_error.to_owned(),
-                        format!("local variable '{varname}' referenced before assignment",),
+                        format!("local variable '{varname}' referenced before assignment").into(),
                     )
                 }
                 let idx = idx.get(arg) as usize;
@@ -1537,7 +1572,8 @@ impl ExecutingFrame<'_> {
                         format!(
                             "local variable '{}' referenced before assignment",
                             self.code.varnames[idx]
-                        ),
+                        )
+                        .into(),
                     )
                 })?;
                 self.push_value(x);
@@ -1556,7 +1592,8 @@ impl ExecutingFrame<'_> {
                         format!(
                             "local variable '{}' referenced before assignment",
                             self.code.varnames[idx1]
-                        ),
+                        )
+                        .into(),
                     )
                 })?;
                 let x2 = fastlocals[idx2].clone().ok_or_else(|| {
@@ -1565,7 +1602,8 @@ impl ExecutingFrame<'_> {
                         format!(
                             "local variable '{}' referenced before assignment",
                             self.code.varnames[idx2]
-                        ),
+                        )
+                        .into(),
                     )
                 })?;
                 drop(fastlocals);
@@ -1589,7 +1627,8 @@ impl ExecutingFrame<'_> {
                         format!(
                             "local variable '{}' referenced before assignment",
                             self.code.varnames[idx]
-                        ),
+                        )
+                        .into(),
                     )
                 })?;
                 self.push_value(x);
@@ -1607,7 +1646,8 @@ impl ExecutingFrame<'_> {
                         format!(
                             "local variable '{}' referenced before assignment",
                             self.code.varnames[idx1]
-                        ),
+                        )
+                        .into(),
                     )
                 })?;
                 let x2 = fastlocals[idx2].clone().ok_or_else(|| {
@@ -1616,7 +1656,8 @@ impl ExecutingFrame<'_> {
                         format!(
                             "local variable '{}' referenced before assignment",
                             self.code.varnames[idx2]
-                        ),
+                        )
+                        .into(),
                     )
                 })?;
                 drop(fastlocals);
@@ -1715,8 +1756,9 @@ impl ExecutingFrame<'_> {
                                     // Get type names for error message
                                     let type_name = cls
                                         .downcast::<crate::builtins::PyType>()
-                                        .map(|t| t.__name__(vm).as_str().to_owned())
-                                        .unwrap_or_else(|_| String::from("?"));
+                                        .ok()
+                                        .and_then(|t| t.__name__(vm).to_str().map(str::to_owned))
+                                        .unwrap_or_else(|| String::from("?"));
                                     let match_args_type_name = match_args.class().__name__(vm);
                                     return Err(vm.new_type_error(format!(
                                         "{}.__match_args__ must be a tuple (got {})",
@@ -2083,7 +2125,7 @@ impl ExecutingFrame<'_> {
             Instruction::StoreAttr { idx } => self.store_attr(vm, idx.get(arg)),
             Instruction::StoreDeref(i) => {
                 let value = self.pop_value();
-                self.cells_frees[i.get(arg) as usize].set(Some(value));
+                self.state.cells_frees[i.get(arg) as usize].set(Some(value));
                 Ok(None)
             }
             Instruction::StoreFast(idx) => {
@@ -2384,7 +2426,7 @@ impl ExecutingFrame<'_> {
         let mod_name_obj = module.get_attr(identifier!(vm, __name__), vm).ok();
         let mod_name_str = mod_name_obj
             .as_ref()
-            .and_then(|n| n.downcast_ref::<PyStr>().map(|s| s.as_str().to_owned()));
+            .and_then(|n| n.downcast_ref::<PyUtf8Str>().map(|s| s.as_str().to_owned()));
         let module_name = mod_name_str.as_deref().unwrap_or("<unknown module name>");
 
         let spec = module
@@ -2443,7 +2485,7 @@ impl ExecutingFrame<'_> {
                 format!("cannot import name '{name}' from '{module_name}' (unknown location)")
             }
         };
-        let err = vm.new_import_error(msg, vm.ctx.new_str(module_name));
+        let err = vm.new_import_error(msg, vm.ctx.new_utf8_str(module_name));
 
         if let Some(ref path) = origin {
             let _ignore = err
@@ -2473,14 +2515,14 @@ impl ExecutingFrame<'_> {
         let require_str = |obj: PyObjectRef, attr: &str| -> PyResult<PyRef<PyStr>> {
             obj.downcast().map_err(|obj: PyObjectRef| {
                 let source = if let Some(ref mod_name) = mod_name {
-                    format!("{}.{attr}", mod_name.as_str())
+                    format!("{}.{attr}", mod_name.as_wtf8())
                 } else {
                     attr.to_owned()
                 };
                 let repr = obj.repr(vm).unwrap_or_else(|_| vm.ctx.new_str("?"));
                 vm.new_type_error(format!(
                     "{} in {} must be str, not {}",
-                    repr.as_str(),
+                    repr.as_wtf8(),
                     source,
                     obj.class().name()
                 ))
@@ -2499,7 +2541,7 @@ impl ExecutingFrame<'_> {
         } else {
             for (k, v) in dict {
                 let k = require_str(k, "__dict__")?;
-                if !k.as_str().starts_with('_') {
+                if !k.as_bytes().starts_with(b"_") {
                     self.locals.mapping().ass_subscript(&k, Some(v), vm)?;
                 }
             }
@@ -2621,10 +2663,13 @@ impl ExecutingFrame<'_> {
             .expect("kwarg names should be tuple of strings");
         let args = self.pop_multiple(nargs as usize);
 
-        let kwarg_names = kwarg_names
-            .as_slice()
-            .iter()
-            .map(|pyobj| pyobj.downcast_ref::<PyStr>().unwrap().as_str().to_owned());
+        let kwarg_names = kwarg_names.as_slice().iter().map(|pyobj| {
+            pyobj
+                .downcast_ref::<PyUtf8Str>()
+                .unwrap()
+                .as_str()
+                .to_owned()
+        });
         FuncArgs::with_kwargs_names(args, kwarg_names)
     }
 
@@ -2639,7 +2684,7 @@ impl ExecutingFrame<'_> {
 
             Self::iterate_mapping_keys(vm, &kw_obj, &func_str, |key| {
                 let key_str = key
-                    .downcast_ref::<PyStr>()
+                    .downcast_ref::<PyUtf8Str>()
                     .ok_or_else(|| vm.new_type_error("keywords must be strings"))?;
                 let value = kw_obj.get_item(&*key, vm)?;
                 kwargs.insert(key_str.as_str().to_owned(), value);
@@ -2679,26 +2724,26 @@ impl ExecutingFrame<'_> {
     /// Returns a display string for a callable object for use in error messages.
     /// For objects with `__qualname__`, returns "module.qualname()" or "qualname()".
     /// For other objects, returns repr(obj).
-    fn object_function_str(obj: &PyObject, vm: &VirtualMachine) -> String {
+    fn object_function_str(obj: &PyObject, vm: &VirtualMachine) -> Wtf8Buf {
+        let repr_fallback = || {
+            obj.repr(vm)
+                .as_ref()
+                .map_or("?".as_ref(), |s| s.as_wtf8())
+                .to_owned()
+        };
         let Ok(qualname) = obj.get_attr(vm.ctx.intern_str("__qualname__"), vm) else {
-            return obj
-                .repr(vm)
-                .map(|s| s.as_str().to_owned())
-                .unwrap_or_else(|_| "?".to_owned());
+            return repr_fallback();
         };
         let Some(qualname_str) = qualname.downcast_ref::<PyStr>() else {
-            return obj
-                .repr(vm)
-                .map(|s| s.as_str().to_owned())
-                .unwrap_or_else(|_| "?".to_owned());
+            return repr_fallback();
         };
         if let Ok(module) = obj.get_attr(vm.ctx.intern_str("__module__"), vm)
             && let Some(module_str) = module.downcast_ref::<PyStr>()
-            && module_str.as_str() != "builtins"
+            && module_str.as_bytes() != b"builtins"
         {
-            return format!("{}.{}()", module_str.as_str(), qualname_str.as_str());
+            return wtf8_concat!(module_str.as_wtf8(), ".", qualname_str.as_wtf8(), "()");
         }
-        format!("{}()", qualname_str.as_str())
+        wtf8_concat!(qualname_str.as_wtf8(), "()")
     }
 
     /// Helper function to iterate over mapping keys using the keys() method.
@@ -2706,7 +2751,7 @@ impl ExecutingFrame<'_> {
     fn iterate_mapping_keys<F>(
         vm: &VirtualMachine,
         mapping: &PyObject,
-        func_str: &str,
+        func_str: &Wtf8,
         mut key_handler: F,
     ) -> PyResult<()>
     where
