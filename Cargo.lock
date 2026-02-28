@@ -1750,6 +1750,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "liblzma"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6033b77c21d1f56deeae8014eb9fbe7bdf1765185a6c508b5ca82eeaed7f899"
+dependencies = [
+ "liblzma-sys",
+]
+
+[[package]]
+name = "liblzma-sys"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f2db66f3268487b5033077f266da6777d057949b8f93c8ad82e441df25e6186"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1813,17 +1833,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab6473172471198271ff72e9379150e9dfd70d8e533e0752a27e515b48dd375e"
 dependencies = [
  "twox-hash",
-]
-
-[[package]]
-name = "lzma-sys"
-version = "0.1.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
 ]
 
 [[package]]
@@ -2529,9 +2538,9 @@ dependencies = [
 
 [[package]]
 name = "pyo3"
-version = "0.28.1"
+version = "0.28.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14c738662e2181be11cb82487628404254902bb3225d8e9e99c31f3ef82a405c"
+checksum = "cf85e27e86080aafd5a22eae58a162e133a589551542b3e5cee4beb27e54f8e1"
 dependencies = [
  "libc",
  "once_cell",
@@ -2543,18 +2552,18 @@ dependencies = [
 
 [[package]]
 name = "pyo3-build-config"
-version = "0.28.1"
+version = "0.28.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9ca0864a7dd3c133a7f3f020cbff2e12e88420da854c35540fd20ce2d60e435"
+checksum = "8bf94ee265674bf76c09fa430b0e99c26e319c945d96ca0d5a8215f31bf81cf7"
 dependencies = [
  "target-lexicon",
 ]
 
 [[package]]
 name = "pyo3-ffi"
-version = "0.28.1"
+version = "0.28.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dfc1956b709823164763a34cc42bbfd26b8730afa77809a3df8b94a3ae3b059"
+checksum = "491aa5fc66d8059dd44a75f4580a2962c1862a1c2945359db36f6c2818b748dc"
 dependencies = [
  "libc",
  "pyo3-build-config",
@@ -2562,9 +2571,9 @@ dependencies = [
 
 [[package]]
 name = "pyo3-macros"
-version = "0.28.1"
+version = "0.28.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29dc660ad948bae134d579661d08033fbb1918f4529c3bbe3257a68f2009ddf2"
+checksum = "f5d671734e9d7a43449f8480f8b38115df67bef8d21f76837fa75ee7aaa5e52e"
 dependencies = [
  "proc-macro2",
  "pyo3-macros-backend",
@@ -2574,9 +2583,9 @@ dependencies = [
 
 [[package]]
 name = "pyo3-macros-backend"
-version = "0.28.1"
+version = "0.28.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e78cd6c6d718acfcedf26c3d21fe0f053624368b0d44298c55d7138fde9331f7"
+checksum = "22faaa1ce6c430a1f71658760497291065e6450d7b5dc2bcf254d49f66ee700a"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -2839,7 +2848,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_ast"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?rev=a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=f14edd8661e2803254f89265548c7487f47a09f6#f14edd8661e2803254f89265548c7487f47a09f6"
 dependencies = [
  "aho-corasick",
  "bitflags 2.11.0",
@@ -2857,7 +2866,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_parser"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?rev=a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=f14edd8661e2803254f89265548c7487f47a09f6#f14edd8661e2803254f89265548c7487f47a09f6"
 dependencies = [
  "bitflags 2.11.0",
  "bstr",
@@ -2877,7 +2886,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_trivia"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?rev=a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=f14edd8661e2803254f89265548c7487f47a09f6#f14edd8661e2803254f89265548c7487f47a09f6"
 dependencies = [
  "itertools 0.14.0",
  "ruff_source_file",
@@ -2888,7 +2897,7 @@ dependencies = [
 [[package]]
 name = "ruff_source_file"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?rev=a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=f14edd8661e2803254f89265548c7487f47a09f6#f14edd8661e2803254f89265548c7487f47a09f6"
 dependencies = [
  "memchr",
  "ruff_text_size",
@@ -2897,7 +2906,7 @@ dependencies = [
 [[package]]
 name = "ruff_text_size"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?rev=a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=f14edd8661e2803254f89265548c7487f47a09f6#f14edd8661e2803254f89265548c7487f47a09f6"
 dependencies = [
  "get-size2",
 ]
@@ -3230,9 +3239,10 @@ dependencies = [
  "indexmap",
  "itertools 0.14.0",
  "libc",
+ "liblzma",
+ "liblzma-sys",
  "libsqlite3-sys",
  "libz-rs-sys",
- "lzma-sys",
  "mac_address",
  "malachite-bigint",
  "md-5",
@@ -3291,7 +3301,6 @@ dependencies = [
  "x509-cert",
  "x509-parser",
  "xml",
- "xz2",
 ]
 
 [[package]]
@@ -4822,15 +4831,6 @@ name = "xml"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8aa498d22c9bbaf482329839bc5620c46be275a19a812e9a22a2b07529a642a"
-
-[[package]]
-name = "xz2"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
-dependencies = [
- "lzma-sys",
-]
 
 [[package]]
 name = "zerocopy"

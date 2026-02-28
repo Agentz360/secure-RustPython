@@ -292,7 +292,11 @@ impl<T: Clone> Dict<T> {
                     // The dict was changed since we did lookup. Let's try again.
                 }
             } else {
-                // New key:
+                // New key - validate slot is still what lookup found
+                if inner.indices.get(index_index) != Some(&entry_index) {
+                    // Dict was resized since lookup, retry
+                    continue;
+                }
                 inner.unchecked_push(index_index, hash, key.to_pyobject(vm), value, entry_index);
                 break None;
             }
@@ -431,6 +435,9 @@ impl<T: Clone> Dict<T> {
                 }
             } else {
                 let mut inner = self.write();
+                if inner.indices.get(index_index) != Some(&entry) {
+                    continue;
+                }
                 inner.unchecked_push(index_index, hash, key.to_owned(), value, entry);
                 break None;
             }
@@ -444,31 +451,32 @@ impl<T: Clone> Dict<T> {
         F: FnOnce() -> T,
     {
         let hash = key.key_hash(vm)?;
-        let res = loop {
-            let lookup = self.lookup(vm, key, hash, None)?;
-            let (index_entry, index_index) = lookup;
+        let mut default = Some(default);
+        loop {
+            let (index_entry, index_index) = self.lookup(vm, key, hash, None)?;
             if let Some(index) = index_entry.index() {
                 let inner = self.read();
                 if let Some(entry) = inner.get_entry_checked(index, index_index) {
-                    break entry.value.clone();
-                } else {
-                    // The dict was changed since we did lookup, let's try again.
-                    continue;
+                    return Ok(entry.value.clone());
                 }
-            } else {
-                let value = default();
-                let mut inner = self.write();
-                inner.unchecked_push(
-                    index_index,
-                    hash,
-                    key.to_pyobject(vm),
-                    value.clone(),
-                    index_entry,
-                );
-                break value;
+                continue;
             }
-        };
-        Ok(res)
+            let mut inner = self.write();
+            if inner.indices.get(index_index) != Some(&index_entry) {
+                continue;
+            }
+            let value = default
+                .take()
+                .expect("default must only be computed on insertion")();
+            inner.unchecked_push(
+                index_index,
+                hash,
+                key.to_pyobject(vm),
+                value.clone(),
+                index_entry,
+            );
+            return Ok(value);
+        }
     }
 
     #[allow(dead_code)]
@@ -483,27 +491,28 @@ impl<T: Clone> Dict<T> {
         F: FnOnce() -> T,
     {
         let hash = key.key_hash(vm)?;
-        let res = loop {
-            let lookup = self.lookup(vm, key, hash, None)?;
-            let (index_entry, index_index) = lookup;
+        let mut default = Some(default);
+        loop {
+            let (index_entry, index_index) = self.lookup(vm, key, hash, None)?;
             if let Some(index) = index_entry.index() {
                 let inner = self.read();
                 if let Some(entry) = inner.get_entry_checked(index, index_index) {
-                    break (entry.key.clone(), entry.value.clone());
-                } else {
-                    // The dict was changed since we did lookup, let's try again.
-                    continue;
+                    return Ok((entry.key.clone(), entry.value.clone()));
                 }
-            } else {
-                let value = default();
-                let key = key.to_pyobject(vm);
-                let mut inner = self.write();
-                let ret = (key.clone(), value.clone());
-                inner.unchecked_push(index_index, hash, key, value, index_entry);
-                break ret;
+                continue;
             }
-        };
-        Ok(res)
+            let mut inner = self.write();
+            if inner.indices.get(index_index) != Some(&index_entry) {
+                continue;
+            }
+            let value = default
+                .take()
+                .expect("default must only be computed on insertion")();
+            let key_obj = key.to_pyobject(vm);
+            let ret = (key_obj.clone(), value.clone());
+            inner.unchecked_push(index_index, hash, key_obj, value, index_entry);
+            return Ok(ret);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -594,9 +603,13 @@ impl<T: Clone> Dict<T> {
         let ret = 'outer: loop {
             let (entry_key, ret) = {
                 let inner = lock.take().unwrap_or_else(|| self.read());
-                let idxs = idxs.get_or_insert_with(|| {
-                    GenIndexes::new(hash_value, (inner.indices.len() - 1) as i64)
-                });
+                let mask = (inner.indices.len() - 1) as i64;
+                let idxs = idxs.get_or_insert_with(|| GenIndexes::new(hash_value, mask));
+                if idxs.mask != mask {
+                    // Dict was resized since last probe, restart
+                    *idxs = GenIndexes::new(hash_value, mask);
+                    free_slot = None;
+                }
                 loop {
                     let index_index = idxs.next();
                     let index_entry = *unsafe {

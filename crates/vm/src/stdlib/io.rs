@@ -435,7 +435,7 @@ mod _io {
 
         #[pymethod]
         fn fileno(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-            _unsupported(vm, &zelf, "truncate")
+            _unsupported(vm, &zelf, "fileno")
         }
 
         #[pyattr]
@@ -477,8 +477,9 @@ mod _io {
         }
 
         #[pymethod]
-        fn isatty(_self: PyObjectRef) -> bool {
-            false
+        fn isatty(instance: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
+            check_closed(&instance, vm)?;
+            Ok(false)
         }
 
         #[pygetset]
@@ -4593,6 +4594,15 @@ mod _io {
         #[pymethod]
         const fn seekable(&self) -> bool {
             true
+        }
+
+        #[pymethod]
+        fn flush(&self, vm: &VirtualMachine) -> PyResult<()> {
+            if self.closed.load() {
+                Err(io_closed_error(vm))
+            } else {
+                Ok(())
+            }
         }
 
         #[pymethod]
